@@ -1,0 +1,11 @@
+{
+  "domain": "aruba_central",
+  "name": "Aruba Central Device Tracker",
+  "version": "0.1.0",
+  "documentation": "https://github.com/BvOWentzo/aruba_central_ha",
+  "requirements": [],
+  "codeowners": ["@BvOWentzo"],
+  "iot_class": "cloud_polling",
+  "platforms": ["device_tracker"]
+}
+
