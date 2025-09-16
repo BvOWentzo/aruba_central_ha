@@ -1,0 +1,15 @@
+configuration.yaml
+
+device_tracker:
+  - platform: aruba_central
+    client_id: !secret aruba_central_client_id
+    client_secret: !secret aruba_central_client_secret
+    refresh_token: !secret aruba_central_refresh_token
+    customer_id: !secret aruba_central_customer_id   # optioneel
+    api_base: https://apigw-eu3.central.arubanetworks.com
+    oauth_base: https://eu3.arubanetworks.com
+    site: "Twello"       # optioneel
+    group: "LAB_IoT"     # optioneel
+    ap_serials:          # optioneel
+      - "CNxxxxxxxx"
+    scan_interval: 60
