@@ -1,271 +1,326 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
+from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 import aiohttp
 import voluptuous as vol
 
-from homeassistant.components.device_tracker import SOURCE_TYPE_ROUTER
+from homeassistant.components.device_tracker.const import SOURCE_TYPE_ROUTER
 from homeassistant.components.device_tracker.config_entry import TrackerEntity
 from homeassistant.const import CONF_SCAN_INTERVAL
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_interval
-from datetime import timedelta
 
-# -----------------------------
-# YAML schema (platform style)
-# -----------------------------
+_LOGGER = logging.getLogger(__name__)
+
+# ---- YAML options
 CONF_CLIENT_ID = "client_id"
 CONF_CLIENT_SECRET = "client_secret"
 CONF_REFRESH_TOKEN = "refresh_token"
-CONF_CUSTOMER_ID = "customer_id"
-CONF_API_BASE = "api_base"      # bv. https://apigw-eu3.central.arubanetworks.com
-CONF_OAUTH_BASE = "oauth_base"  # bv. https://eu3.arubanetworks.com
-CONF_SITE = "site"
-CONF_GROUP = "group"
-CONF_AP_SERIALS = "ap_serials"
+CONF_CUSTOMER_ID = "customer_id"     # optional, used as TenantID header
+CONF_API_BASE = "api_base"           # e.g. https://apigw-eu2.central.arubanetworks.com
+CONF_OAUTH_BASE = "oauth_base"       # e.g. https://eu2.arubanetworks.com
+CONF_SITE = "site"                   # optional
+CONF_GROUP = "group"                 # optional (name or GUID)
+CONF_GROUP_ID = "group_id"           # optional (GUID; mapped to 'group' if provided)
+CONF_AP_SERIALS = "ap_serials"       # optional list[str]
+CONF_CLIENT_TYPE = "client_type"     # WIRELESS | WIRED | ALL
+CONF_CLIENT_STATUS = "client_status" # CONNECTED | FAILED
 
-DEFAULT_SCAN_SECONDS = 60
+DEFAULT_SCAN_INTERVAL = 60
+DEFAULT_CLIENT_TYPE = "WIRELESS"
+DEFAULT_CLIENT_STATUS = "CONNECTED"
 
-PLATFORM_SCHEMA = cv.PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_CLIENT_ID): cv.string,
         vol.Required(CONF_CLIENT_SECRET): cv.string,
         vol.Required(CONF_REFRESH_TOKEN): cv.string,
+        vol.Required(CONF_API_BASE): cv.url,
+        vol.Required(CONF_OAUTH_BASE): cv.url,
         vol.Optional(CONF_CUSTOMER_ID): cv.string,
-        vol.Required(CONF_API_BASE): cv.string,
-        vol.Required(CONF_OAUTH_BASE): cv.string,
         vol.Optional(CONF_SITE): cv.string,
         vol.Optional(CONF_GROUP): cv.string,
+        vol.Optional(CONF_GROUP_ID): cv.string,
         vol.Optional(CONF_AP_SERIALS): vol.All(cv.ensure_list, [cv.string]),
-        vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_SECONDS): cv.positive_int,
+        vol.Optional(CONF_CLIENT_TYPE, default=DEFAULT_CLIENT_TYPE): vol.In(["WIRELESS", "WIRED", "ALL"]),
+        vol.Optional(CONF_CLIENT_STATUS, default=DEFAULT_CLIENT_STATUS): vol.In(["CONNECTED", "FAILED"]),
+        vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): vol.Coerce(int),
     }
 )
 
-# -----------------------------
-# Mini Aruba Central client
-# -----------------------------
-class _Central:
-    def __init__(
-        self,
-        session: aiohttp.ClientSession,
-        api_base: str,
-        oauth_base: str,
-        client_id: str,
-        client_secret: str,
-        refresh_token: str,
-        customer_id: Optional[str],
-        log,
-    ) -> None:
-        self.s = session
-        self.api_base = api_base.rstrip("/")
-        self.oauth_base = oauth_base.rstrip("/")
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.refresh_token = refresh_token
-        self.customer_id = customer_id
-        self.access_token: Optional[str] = None
-        self.expiry = 0.0
-        self.log = log
-
-    async def _ensure_token(self):
-        now = time.time()
-        if self.access_token and now < (self.expiry - 60):
-            return
-        data = {
-            "grant_type": "refresh_token",
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "refresh_token": self.refresh_token,
-        }
-        url = f"{self.oauth_base}/oauth2/token"
-        async with self.s.post(url, data=data, timeout=30) as r:
-            if r.status != 200:
-                raise RuntimeError(f"Token refresh failed ({r.status}): {await r.text()}")
-            j = await r.json()
-        self.access_token = j.get("access_token")
-        self.expiry = time.time() + float(j.get("expires_in", 3600))
-        new_rt = j.get("refresh_token")
-        if new_rt:
-            self.refresh_token = new_rt
-        self.log.debug("Aruba Central token refreshed")
-
-    async def _get(self, path: str, params: Optional[Dict[str, Any]] = None):
-        await self._ensure_token()
-        headers = {"Authorization": f"Bearer {self.access_token}"}
-        if self.customer_id:
-            headers["X-Customer-ID"] = self.customer_id
-        url = f"{self.api_base}{path}"
-        async with self.s.get(url, headers=headers, params=params, timeout=30) as r:
-            if r.status != 200:
-                raise RuntimeError(f"GET {path} failed ({r.status}): {await r.text()}")
-            return await r.json()
-
-    async def list_clients(
-        self,
-        *,
-        site: Optional[str],
-        group: Optional[str],
-        ap_serials: Optional[List[str]],
-        limit: int = 1000,
-        client_type: str = "wireless",
-    ) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {"limit": str(limit), "client_type": client_type.upper()}
-        if site:
-            params["site"] = site
-        if group:
-            params["group"] = group
-        if ap_serials:
-            params["access_points"] = ",".join(ap_serials)
-
-        # try v2, fall back to v1
-        try:
-            j = await self._get("/monitoring/v2/clients", params=params)
-            items = j.get("clients") or j.get("data") or j
-            if isinstance(items, list):
-                return items
-        except Exception:
-            pass
-        j = await self._get("/monitoring/v1/clients", params=params)
-        items = j.get("clients") or j.get("data") or j
-        return items if isinstance(items, list) else []
-
-# -----------------------------
-# Platform setup
-# -----------------------------
-async def async_get_scanner(hass: HomeAssistant, config):
-    # We implement entity-based tracker, not legacy DeviceScanner -> return None
-    return None
-
-async def async_setup_platform(hass: HomeAssistant, config, async_add_entities, discovery_info=None):
-    import logging
-    log = logging.getLogger("custom_components.aruba_central")
-
-    scan_seconds = int(config.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_SECONDS))
+async def async_setup_platform(hass: HomeAssistant, config: dict, async_add_entities, discovery_info=None):
     session = async_get_clientsession(hass)
-
-    api = _Central(
+    api = ArubaCentralAPI(
         session=session,
-        api_base=config[CONF_API_BASE],
-        oauth_base=config[CONF_OAUTH_BASE],
+        api_base=config[CONF_API_BASE].rstrip("/"),
+        oauth_base=config[CONF_OAUTH_BASE].rstrip("/"),
         client_id=config[CONF_CLIENT_ID],
         client_secret=config[CONF_CLIENT_SECRET],
         refresh_token=config[CONF_REFRESH_TOKEN],
         customer_id=config.get(CONF_CUSTOMER_ID),
-        log=log,
     )
 
-    state: Dict[str, Dict[str, Any]] = {}  # mac -> normalized client dict
-    entities: Dict[str, ArubaCentralTracker] = {}  # mac -> entity
+    tracker = ArubaCentralTracker(
+        hass=hass,
+        api=api,
+        site=config.get(CONF_SITE),
+        group=config.get(CONF_GROUP),
+        group_id=config.get(CONF_GROUP_ID),
+        ap_serials=config.get(CONF_AP_SERIALS) or [],
+        client_type=config.get(CONF_CLIENT_TYPE, DEFAULT_CLIENT_TYPE),
+        client_status=config.get(CONF_CLIENT_STATUS, DEFAULT_CLIENT_STATUS),
+        scan_interval=timedelta(seconds=config.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)),
+        async_add_entities=async_add_entities,
+    )
 
-    async def _poll(now=None):
+    await tracker.async_start()
+
+
+# ---------------- API client ----------------
+
+class ArubaCentralAPI:
+    def __init__(self, session: aiohttp.ClientSession, api_base: str, oauth_base: str,
+                 client_id: str, client_secret: str, refresh_token: str, customer_id: Optional[str]):
+        self._session = session
+        self._api_base = api_base
+        self._oauth_base = oauth_base
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._refresh_token = refresh_token
+        self._access_token: Optional[str] = None
+        self._access_expiry: float = 0
+        self._customer_id = customer_id
+
+    async def _ensure_token(self):
+        # Refresh if absent or expiring (<60s left)
+        if self._access_token and time.time() < self._access_expiry - 60:
+            return
+        data = {
+            "grant_type": "refresh_token",
+            "client_id": self._client_id,
+            "client_secret": self._client_secret,
+            "refresh_token": self._refresh_token,
+        }
+        url = f"{self._oauth_base}/oauth2/token"
+        async with self._session.post(url, data=data, timeout=30) as resp:
+            txt = await resp.text()
+            if resp.status != 200:
+                raise RuntimeError(f"Token refresh failed {resp.status}: {txt}")
+            payload = await resp.json()
+            self._access_token = payload.get("access_token")
+            # sommige tenants geven ook een nieuwe refresh_token terug
+            self._refresh_token = payload.get("refresh_token", self._refresh_token)
+            # Central access tokens zijn meestal ~2 uur geldig; neem expires_in als aanwezig
+            self._access_expiry = time.time() + int(payload.get("expires_in", 3600))
+            _LOGGER.debug("Aruba Central token refreshed; expires_in=%s", payload.get("expires_in"))
+
+    def _headers(self) -> Dict[str, str]:
+        headers = {"Authorization": f"Bearer {self._access_token}"}
+        if self._customer_id:
+            headers["TenantID"] = self._customer_id
+        return headers
+
+    async def list_groups(self) -> List[str]:
+        """Alle groepsnamen; handig om GUID->naam te mappen indien nodig."""
+        await self._ensure_token()
+        url = f"{self._api_base}/configuration/v2/groups"
+        async with self._session.get(url, headers=self._headers(), timeout=30) as resp:
+            if resp.status != 200:
+                _LOGGER.debug("groups list failed: %s", await resp.text())
+                return []
+            data = await resp.json()
+            # response: {"data":[{"group":"name1"}, ...]}
+            return [g.get("group") for g in (data.get("data") or []) if "group" in g]
+
+    async def get_clients(self, *,
+                          site: Optional[str],
+                          group: Optional[str],
+                          ap_serials: List[str],
+                          client_type: str,
+                          client_status: str) -> List[Dict[str, Any]]:
+        """Ophalen via /monitoring/v2/clients met filtering & paginatie."""
+        await self._ensure_token()
+
+        params: Dict[str, Any] = {
+            "client_status": client_status,            # CONNECTED | FAILED
+            "limit": 1000,
+        }
+
+        # Client type: ALL => 2 calls en samenvoegen
+        if client_type in ("WIRELESS", "WIRED"):
+            params["client_type"] = client_type
+
+        # één van: group/site/label/network/cluster_id/swarm_id
+        if group:
+            params["group"] = group
+        elif site:
+            params["site"] = site
+
+        if ap_serials:
+            # v2 API accepteert 'serial' filter; meerdere waarden comma-separated
+            params["serial"] = ",".join(ap_serials)
+
+        url = f"{self._api_base}/monitoring/v2/clients"
+
+        async def _fetch_one(ptype: Optional[str]) -> List[Dict[str, Any]]:
+            p = dict(params)
+            if ptype:
+                p["client_type"] = ptype
+            items: List[Dict[str, Any]] = []
+            last = None
+            for _ in range(10):  # safety: max 10 pagina’s
+                if last:
+                    p["last_client_mac"] = last
+                async with self._session.get(url, headers=self._headers(), params=p, timeout=30) as resp:
+                    txt = await resp.text()
+                    if resp.status != 200:
+                        raise RuntimeError(f"clients fetch failed {resp.status}: {txt}")
+                    data = await resp.json()
+                    chunk = data.get("data") or data.get("clients") or []
+                    items.extend(chunk)
+                    last = data.get("last_client_mac")
+                    if not last or not chunk:
+                        break
+            return items
+
+        if client_type == "ALL":
+            wl, wd = await asyncio.gather(_fetch_one("WIRELESS"), _fetch_one("WIRED"))
+            return wl + wd
+        else:
+            return await _fetch_one(None)
+
+# ------------- Tracker --------------
+
+class ArubaCentralTracker:
+    def __init__(self, hass: HomeAssistant, api: ArubaCentralAPI, *,
+                 site: Optional[str], group: Optional[str], group_id: Optional[str],
+                 ap_serials: List[str], client_type: str, client_status: str,
+                 scan_interval: timedelta, async_add_entities):
+        self.hass = hass
+        self.api = api
+        self.site = site
+        self.group = group
+        self.group_id = group_id
+        self.ap_serials = ap_serials
+        self.client_type = client_type
+        self.client_status = client_status
+        self.scan_interval = scan_interval
+        self.async_add_entities = async_add_entities
+        self.entities: dict[str, ArubaClientEntity] = {}
+
+    async def async_start(self):
+        # Indien group_id is opgegeven maar geen group naam: probeer GUID direct,
+        # lukt dat niet dan mappen we GUID->naam via /configuration/v2/groups (fallback).
+        if self.group_id and not self.group:
+            self.group = self.group_id  # veel tenants accepteren GUID in 'group'
+            _LOGGER.debug("Using group_id as 'group' filter: %s", self.group_id)
+
+        await self._poll_update()
+        async_track_time_interval(self.hass, self._poll_update, self.scan_interval)
+
+    async def _poll_update(self, *_):
         try:
-            raw = await api.list_clients(
-                site=config.get(CONF_SITE),
-                group=config.get(CONF_GROUP),
-                ap_serials=config.get(CONF_AP_SERIALS),
-                limit=1000,
-                client_type="wireless",
+            clients = await self.api.get_clients(
+                site = self.site,
+                group = self.group,
+                ap_serials = self.ap_serials,
+                client_type = self.client_type,
+                client_status = self.client_status,
             )
-        except Exception as e:
-            log.warning("Aruba Central poll failed: %s", e)
-            # mark all as disconnected (optional: keep last seen)
-            for ent in entities.values():
-                ent.set_snapshot({"mac": ent.mac, "connected": False})
+            _LOGGER.debug("Fetched %d clients from Central", len(clients))
+        except Exception as exc:
+            _LOGGER.error("Aruba Central poll failed: %s", exc)
             return
 
-        snapshot: Dict[str, Dict[str, Any]] = {}
-        for c in raw:
+        seen = set()
+
+        for c in clients:
             mac = (c.get("macaddr") or c.get("mac") or "").lower()
             if not mac:
                 continue
-            snapshot[mac] = {
-                "mac": mac,
-                "ip": c.get("ip_address") or c.get("ip") or None,
-                "hostname": c.get("name") or c.get("hostname") or c.get("device_name") or mac,
-                "ssid": c.get("essid") or c.get("ssid") or None,
-                "ap_name": c.get("ap_name") or c.get("associated_device") or c.get("associated_ap") or None,
-                "rssi": c.get("rssi") or c.get("signal") or None,
-                "manufacturer": c.get("manufacturer") or None,
-                "user_role": c.get("user_role") or c.get("role") or None,
-                "vlan": c.get("vlan") or c.get("vlan_id") or None,
-                "connected": True
-                if c.get("connected") is None
-                else bool(c.get("connected")),
-            }
+            seen.add(mac)
+            name = c.get("name") or c.get("hostname") or c.get("username") or mac
+            ip = c.get("ipaddr") or c.get("ip_address")
+            ap_name = c.get("associated_device") or c.get("ap_name") or c.get("sw_name")
+            manufacturer = c.get("manufacturer")
+            os_type = c.get("os_type")
+            rssi = c.get("signal_db") or c.get("rssi")
 
-        # update/create entities
-        for mac, data in snapshot.items():
-            state[mac] = data
-            if mac not in entities:
-                ent = ArubaCentralTracker(mac, lambda m: state.get(m, {"mac": m, "connected": False}))
-                entities[mac] = ent
-                async_add_entities([ent], True)
-            else:
-                entities[mac].set_snapshot(data)
+            if mac not in self.entities:
+                ent = ArubaClientEntity(mac=mac, name=name)
+                self.entities[mac] = ent
+                self.async_add_entities([ent])
 
-        # mark disappeared as disconnected
-        vanished = set(state.keys()) - set(snapshot.keys())
-        for mac in vanished:
-            state[mac] = {"mac": mac, "connected": False}
-            if mac in entities:
-                entities[mac].set_snapshot(state[mac])
+            self.entities[mac].update_from_api(
+                ip=ip,
+                ap_name=ap_name,
+                manufacturer=manufacturer,
+                os_type=os_type,
+                rssi=rssi,
+            )
 
-    # first poll, then schedule
-    await _poll()
-    async_track_time_interval(hass, _poll, timedelta(seconds=scan_seconds))
+        # markeer vermiste clients als 'weg'
+        for mac, ent in list(self.entities.items()):
+            ent.seen(now=(mac in seen))
 
-# -----------------------------
-# Tracker Entity
-# -----------------------------
-class ArubaCentralTracker(TrackerEntity):
-    _attr_source_type = SOURCE_TYPE_ROUTER
-    _attr_icon = "mdi:wifi"
+class ArubaClientEntity(TrackerEntity):
+    def __init__(self, mac: str, name: str):
+        self._mac = mac
+        self._name = name
+        self._ip: Optional[str] = None
+        self._ap_name: Optional[str] = None
+        self._manufacturer: Optional[str] = None
+        self._os_type: Optional[str] = None
+        self._rssi: Optional[int] = None
+        self._is_home: bool = True
+        self._attrs: Dict[str, Any] = {}
 
-    def __init__(self, mac: str, resolver):
-        self.mac = mac
-        self._resolver = resolver
-        self._attr_unique_id = f"aruba_central_{mac.replace(':','')}"
-        self._last: Dict[str, Any] = {"mac": mac, "connected": False}
-
-    def set_snapshot(self, snap: Dict[str, Any]):
-        self._last = snap
-        self.async_write_ha_state()
+    @property
+    def unique_id(self) -> str:
+        return f"aruba_central_{self._mac}"
 
     @property
     def name(self) -> str:
-        h = self._client.get("hostname")
-        return h or self.mac
+        return self._name
+
+    @property
+    def source_type(self) -> str:
+        return SOURCE_TYPE_ROUTER
 
     @property
     def is_connected(self) -> bool:
-        return bool(self._client.get("connected"))
+        return self._is_home
+
+    @property
+    def mac_address(self) -> str:
+        return self._mac
 
     @property
     def extra_state_attributes(self) -> Dict[str, Any]:
-        c = self._client
-        attrs = {
-            "mac": c.get("mac"),
-            "ip": c.get("ip"),
-            "hostname": c.get("hostname"),
-            "ssid": c.get("ssid"),
-            "ap_name": c.get("ap_name"),
-            "rssi": c.get("rssi"),
-            "manufacturer": c.get("manufacturer"),
-            "user_role": c.get("user_role"),
-            "vlan": c.get("vlan"),
+        return self._attrs
+
+    def update_from_api(self, *, ip: Optional[str], ap_name: Optional[str],
+                        manufacturer: Optional[str], os_type: Optional[str], rssi: Optional[int]):
+        self._ip = ip
+        self._ap_name = ap_name
+        self._manufacturer = manufacturer
+        self._os_type = os_type
+        self._rssi = rssi
+        self._is_home = True
+        self._attrs = {
+            "ip": self._ip,
+            "associated_device": self._ap_name,
+            "manufacturer": self._manufacturer,
+            "os_type": self._os_type,
+            "rssi": self._rssi,
         }
-        return {k: v for k, v in attrs.items() if v is not None}
 
-    @property
-    def _client(self) -> Dict[str, Any]:
-        # prefer live resolver; fall back to last snapshot
-        return self._resolver(self.mac) or self._last
-
-    async def async_update(self) -> None:
-        # Coordinator-loos; updates komen via scheduler, hier niets te doen.
-        return
+    def seen(self, now: bool):
+        self._is_home = now
