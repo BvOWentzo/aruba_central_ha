@@ -23,6 +23,7 @@ from homeassistant.helpers.update_coordinator import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_LOGGER.warning("aruba_central(Coordinator): module import OK")
 
 CONF_CLIENT_ID = "client_id"
 CONF_CLIENT_SECRET = "client_secret"
@@ -55,6 +56,7 @@ PLATFORM_SCHEMA = BASE_PLATFORM_SCHEMA.extend(
 )
 
 async def async_setup_platform(hass: HomeAssistant, config: dict, async_add_entities, discovery_info=None):
+    _LOGGER.warning("aruba_central(Coordinator): setup_platform START")
     session = async_get_clientsession(hass)
     api_base = config[CONF_API_BASE].rstrip("/")
     oauth_base = (config.get(CONF_OAUTH_BASE) or api_base).rstrip("/")
@@ -66,6 +68,7 @@ async def async_setup_platform(hass: HomeAssistant, config: dict, async_add_enti
         update_interval = cv.time_period_str(si)
     else:
         update_interval = si
+    _LOGGER.warning("aruba_central(Coordinator): update_interval=%ss", int(update_interval.total_seconds()))
 
     api = _CentralAPI(
         session=session,
@@ -86,7 +89,9 @@ async def async_setup_platform(hass: HomeAssistant, config: dict, async_add_enti
         client_type=config.get(CONF_CLIENT_TYPE, DEFAULT_CLIENT_TYPE),
     )
 
-    await coordinator.async_config_entry_first_refresh()
+    # FORCEEER een eerste refresh en start de periodieke updates
+    await coordinator.async_refresh()
+    _LOGGER.warning("aruba_central(Coordinator): initial refresh done (ok=%s)", coordinator.last_update_success)
 
     entities: Dict[str, ArubaClientEntity] = {}
     for mac in coordinator.data.keys():
@@ -107,6 +112,7 @@ async def async_setup_platform(hass: HomeAssistant, config: dict, async_add_enti
             async_add_entities(ents)
 
     coordinator.async_add_listener(_on_update)
+    _LOGGER.warning("aruba_central(Coordinator): setup_platform DONE")
 
 
 # ---------- Central API ----------
@@ -141,14 +147,17 @@ class _CentralAPI:
             "client_secret": self.client_secret,
             "refresh_token": self.refresh_token,
         }
+        _LOGGER.warning("aruba_central(Coordinator): POST %s (OAuth refresh)", url)
         async with self.s.post(url, data=data, timeout=30) as r:
             txt = await r.text()
             if r.status != 200:
+                _LOGGER.error("aruba_central(Coordinator): token refresh failed %s: %s", r.status, txt)
                 raise UpdateFailed(f"Token refresh failed {r.status}: {txt}")
             j = await r.json()
         self.access_token = j.get("access_token")
         self.refresh_token = j.get("refresh_token", self.refresh_token)
         self.expiry = time.time() + int(j.get("expires_in", 3600))
+        _LOGGER.warning("aruba_central(Coordinator): token ok; expires_in=%s", j.get("expires_in"))
 
     def _headers(self) -> Dict[str, str]:
         h = {"Authorization": f"Bearer {self.access_token}"}
@@ -173,9 +182,11 @@ class _CentralAPI:
             q = dict(params)
             if last:
                 q["last_client_mac"] = last
+            _LOGGER.warning("aruba_central(Coordinator): GET %s params=%s", url, q)
             async with self.s.get(url, headers=self._headers(), params=q, timeout=30) as r:
                 txt = await r.text()
                 if r.status != 200:
+                    _LOGGER.error("aruba_central(Coordinator): clients fetch failed %s: %s", r.status, txt)
                     raise UpdateFailed(f"clients fetch failed {r.status}: {txt}")
                 data = await r.json()
             chunk = data.get("data") or data.get("clients") or []
@@ -183,6 +194,7 @@ class _CentralAPI:
             last = data.get("last_client_mac")
             if not last or not chunk:
                 break
+        _LOGGER.warning("aruba_central(Coordinator): total clients returned=%s", len(items))
         return items
 
 
@@ -217,6 +229,7 @@ class CentralCoordinator(DataUpdateCoordinator[Dict[str, Dict[str, Any]]]):
                 "ip": c.get("ipaddr") or c.get("ip_address"),
                 "name": c.get("name") or c.get("hostname") or mac,
             }
+        _LOGGER.warning("aruba_central(Coordinator): coordinator built %s MACs", len(out))
         return out
 
 
