@@ -13,14 +13,13 @@ import voluptuous as vol
 from homeassistant.components.device_tracker import (
     PLATFORM_SCHEMA as BASE_PLATFORM_SCHEMA,
     DeviceScanner,
-    DOMAIN as DEVICE_TRACKER_DOMAIN,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 _LOGGER = logging.getLogger(__name__)
-_LOGGER.warning("aruba_central(DeviceScanner): module import OK")
+_LOGGER.warning("aruba_central(DeviceScanner): module import OK (minimal throttle build)")
 
 # Laat HA ons ~1×/min aanroepen i.p.v. ~12s
 SCAN_INTERVAL = timedelta(seconds=60)
@@ -34,7 +33,7 @@ CONF_OAUTH_BASE = "oauth_base"
 CONF_GROUP = "group"
 CONF_SITE = "site"
 CONF_CLIENT_TYPE = "client_type"
-CONF_SCAN_INTERVAL = "scan_interval"  # throttle voor Central API (sec/timedelta/HH:MM:SS)
+CONF_SCAN_INTERVAL = "scan_interval"  # throttle Central API (sec/timedelta/HH:MM:SS)
 
 DEFAULT_CLIENT_TYPE = "WIRELESS"
 DEFAULT_SCAN_INTERVAL_S = 60
@@ -56,20 +55,11 @@ PLATFORM_SCHEMA = BASE_PLATFORM_SCHEMA.extend(
     }
 )
 
-def _flatten_conf(config: dict) -> dict:
-    if DEVICE_TRACKER_DOMAIN in config and isinstance(config[DEVICE_TRACKER_DOMAIN], dict):
-        return config[DEVICE_TRACKER_DOMAIN]
-    return config
-
 async def async_get_scanner(hass: HomeAssistant, config: dict) -> Optional[DeviceScanner]:
-    _LOGGER.warning("aruba_central(DeviceScanner): async_get_scanner START")
-    conf = _flatten_conf(config)
-    for k in (CONF_CLIENT_ID, CONF_CLIENT_SECRET, CONF_REFRESH_TOKEN, CONF_API_BASE):
-        if k not in conf:
-            _LOGGER.error("aruba_central(DeviceScanner): missing required option: %s", k)
-            return None
+    _LOGGER.warning("aruba_central(DeviceScanner): async_get_scanner START (minimal throttle)")
 
-    si = conf.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_S)
+    # YAML scan_interval → throttle voor de Central API
+    si = config.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_S)
     if isinstance(si, int):
         min_interval_s = si
     elif isinstance(si, str):
@@ -80,27 +70,23 @@ async def async_get_scanner(hass: HomeAssistant, config: dict) -> Optional[Devic
         min_interval_s = 5
 
     session = async_get_clientsession(hass)
-    api_base = conf[CONF_API_BASE].rstrip("/")
-    oauth_base = (conf.get(CONF_OAUTH_BASE) or api_base).rstrip("/")
+    api_base = config[CONF_API_BASE].rstrip("/")
+    oauth_base = (config.get(CONF_OAUTH_BASE) or api_base).rstrip("/")
 
     scanner = ArubaCentralScanner(
         session=session,
         api_base=api_base,
         oauth_base=oauth_base,
-        client_id=conf[CONF_CLIENT_ID],
-        client_secret=conf[CONF_CLIENT_SECRET],
-        refresh_token=conf[CONF_REFRESH_TOKEN],
-        customer_id=conf.get(CONF_CUSTOMER_ID),
-        group=conf.get(CONF_GROUP),
-        site=conf.get(CONF_SITE),
-        client_type=conf.get(CONF_CLIENT_TYPE, DEFAULT_CLIENT_TYPE),
+        client_id=config[CONF_CLIENT_ID],
+        client_secret=config[CONF_CLIENT_SECRET],
+        refresh_token=config[CONF_REFRESH_TOKEN],
+        customer_id=config.get(CONF_CUSTOMER_ID),
+        group=config.get(CONF_GROUP),
+        site=config.get(CONF_SITE),
+        client_type=config.get(CONF_CLIENT_TYPE, DEFAULT_CLIENT_TYPE),
         min_interval_s=min_interval_s,
     )
-    await scanner.async_init()
-    _LOGGER.warning(
-        "aruba_central(DeviceScanner): async_get_scanner DONE (api_base=%s, oauth_base=%s, min_interval_s=%s)",
-        api_base, oauth_base, min_interval_s
-    )
+    _LOGGER.warning("aruba_central(DeviceScanner): async_get_scanner DONE; throttle=%ss", min_interval_s)
     return scanner
 
 
@@ -126,19 +112,17 @@ class _CentralAPI:
         self.expiry = 0.0
 
     async def _ensure_token(self):
-        # Nog geldig? (1 minuut speling)
         if self.access_token and time.time() < self.expiry - 60:
             return
-
-        token_url = f"{self.oauth_base}/oauth2/token"
+        url = f"{self.oauth_base}/oauth2/token"
         data = {
             "grant_type": "refresh_token",
             "client_id": self.client_id,
             "client_secret": self.client_secret,
             "refresh_token": self.refresh_token,
         }
-        _LOGGER.warning("aruba_central(DeviceScanner): POST %s (OAuth refresh)", token_url)
-        async with self.s.post(token_url, data=data, timeout=30) as r:
+        _LOGGER.warning("aruba_central(DeviceScanner): POST %s (OAuth refresh)", url)
+        async with self.s.post(url, data=data, timeout=30) as r:
             body = await r.text()
             if r.status != 200:
                 _LOGGER.error("aruba_central(DeviceScanner): token refresh failed %s: %s", r.status, body)
@@ -148,7 +132,6 @@ class _CentralAPI:
             except Exception:
                 _LOGGER.error("aruba_central(DeviceScanner): token refresh invalid JSON: %s", body)
                 raise
-
         self.access_token = j.get("access_token")
         self.refresh_token = j.get("refresh_token", self.refresh_token)
         self.expiry = time.time() + int(j.get("expires_in", 3600))
@@ -229,85 +212,51 @@ class ArubaCentralScanner(DeviceScanner):
         self._client_type = client_type
         self._min_interval_s = max(5, int(min_interval_s))
         self._last_fetch_ts: float = 0.0
-        self._next_due_ts: float = 0.0   # cooldown/next fetch moment
         self._cache_clients: List[Dict[str, Any]] = []
-        self._last_by_mac: Dict[str, Dict[str, Any]] = {}async def async_init(self):
-        _LOGGER.warning(
-            "aruba_central(DeviceScanner): init api_base=%s, oauth_base=%s, group=%s, site=%s, type=%s, min_interval_s=%s",
-            self._api.api_base,
-            self._api.oauth_base,
-            self._group,
-            self._site,
-            self._client_type,
-            self._min_interval_s,
-        )
-
-    async def _fetch_if_needed(self):
-        now = time.time()
-        # Respecteer cooldown/next_due (ook na fouten)
-        if now < self._next_due_ts:
-            _LOGGER.warning("aruba_central(DeviceScanner): skip API until next_due in %ss",
-                            int(self._next_due_ts - now))
-            return
-
-        age = now - self._last_fetch_ts if self._last_fetch_ts else 1e9
-        if self._last_fetch_ts and age < self._min_interval_s:
-            _LOGGER.warning(
-                "aruba_central(DeviceScanner): skip API (age=%ss < min=%ss, next_in=%ss)",
-                int(age),
-                self._min_interval_s,
-                int(self._min_interval_s - age),
-            )
-            self._next_due_ts = now + (self._min_interval_s - age)
-            return
-
-        _LOGGER.warning(
-            "aruba_central(DeviceScanner): calling Central API (age=%ss, min=%ss)",
-            0 if age == 1e9 else int(age),
-            self._min_interval_s,
-        )
-        try:
-            clients = await self._api.list_clients(
-                group=self._group, site=self._site, client_type=self._client_type
-            )
-        except Exception as e:
-            # Cooldown bij failure → probeer pas na min_interval opnieuw
-            self._next_due_ts = now + self._min_interval_s
-            _LOGGER.error("aruba_central(DeviceScanner): API failure, cooldown %ss: %s",
-                          self._min_interval_s, e)
-            return
-
-        self._cache_clients = clients
-        self._last_fetch_ts = now
-        self._next_due_ts = now + self._min_interval_s
-        _LOGGER.warning("aruba_central(DeviceScanner): fetched %s clients (API)", len(clients))
-
-        # Map voor naam/ip lookups
-        self._last_by_mac.clear()
-        for c in clients:
-            mac = (c.get("macaddr") or c.get("mac") or "")
-            if not mac:
-                continue
-            mac = mac.lower()
-            self._last_by_mac[mac] = {
-                "ip": c.get("ipaddr") or c.get("ip_address"),
-                "name": c.get("name") or c.get("hostname") or mac,
-            }
+        self._last_by_mac: Dict[str, Dict[str, Any]] = {}
 
     async def async_scan_devices(self) -> List[str]:
         now = time.time()
-        # Log elke HA-poll met context over fetch-throttle
-        if self._last_fetch_ts:
-            age = now - self._last_fetch_ts
-            wait = int(self._next_due_ts - now) if now < self._next_due_ts else 0
-            _LOGGER.warning(
-                "aruba_central(DeviceScanner): HA poll; last_fetch_age=%ss; next_due_in=%ss; throttle=%ss",
-                int(age), max(0, wait), self._min_interval_s,
-            )
+
+        # Beslissingslogging
+        if self._last_fetch_ts == 0:
+            _LOGGER.warning("aruba_central(DeviceScanner): DECISION first-run → call Central now")
+            do_call = True
         else:
-            _LOGGER.warning("aruba_central(DeviceScanner): HA poll; first run; throttle=%ss",
-                            self._min_interval_s)
-await self._fetch_if_needed()
+            age = now - self._last_fetch_ts
+            if age >= self._min_interval_s:
+                _LOGGER.warning("aruba_central(DeviceScanner): DECISION age=%ss >= min=%ss → call Central",
+                                int(age), self._min_interval_s)
+                do_call = True
+            else:
+                _LOGGER.warning("aruba_central(DeviceScanner): DECISION age=%ss < min=%ss → use cache",
+                                int(age), self._min_interval_s)
+                do_call = False
+
+        if do_call:
+            try:
+                clients = await self._api.list_clients(
+                    group=self._group, site=self._site, client_type=self._client_type
+                )
+                self._cache_clients = clients
+                self._last_fetch_ts = now
+                _LOGGER.warning("aruba_central(DeviceScanner): fetched %s clients (API)", len(clients))
+                # map for lookups
+                self._last_by_mac.clear()
+                for c in clients:
+                    mac = (c.get("macaddr") or c.get("mac") or "")
+                    if mac:
+                        mac = mac.lower()
+                        self._last_by_mac[mac] = {
+                            "ip": c.get("ipaddr") or c.get("ip_address"),
+                            "name": c.get("name") or c.get("hostname") or mac,
+                        }
+            except Exception as e:
+                # Note: backoff: beschouw dit als fetch-tijdstip om 12s retry-stormen te voorkomen
+                self._last_fetch_ts = now
+                _LOGGER.error("aruba_central(DeviceScanner): API error; backing off %ss: %s",
+                              self._min_interval_s, e)
+
         macs: List[str] = []
         for c in self._cache_clients:
             mac = (c.get("macaddr") or c.get("mac") or "").lower()
@@ -322,6 +271,6 @@ await self._fetch_if_needed()
     async def async_get_extra_attributes(self, device: str) -> Dict[str, Any]:
         info = self._last_by_mac.get(device.lower()) or {}
         out: Dict[str, Any] = {"mac": device.lower()}
-        if "ip" in info and info["ip"]:
+        if info.get("ip"):
             out["ip"] = info["ip"]
         return out
