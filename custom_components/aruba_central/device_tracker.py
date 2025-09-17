@@ -22,7 +22,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.warning("aruba_central(DeviceScanner): module import OK")
 
-# Laat HA ons elke 60s aanroepen i.p.v. ~12s
+# Laat HA ons elke ~60s aanroepen i.p.v. ~12s
 SCAN_INTERVAL = timedelta(seconds=60)
 
 CONF_CLIENT_ID = "client_id"
@@ -99,8 +99,8 @@ async def async_get_scanner(hass: HomeAssistant, config: dict) -> Optional[Devic
     )
     await scanner.async_init()
     _LOGGER.warning(
-        "aruba_central(DeviceScanner): async_get_scanner DONE (api_base=%s, min_interval_s=%s)",
-        api_base, min_interval_s
+        "aruba_central(DeviceScanner): async_get_scanner DONE (api_base=%s, oauth_base=%s, min_interval_s=%s)",
+        api_base, oauth_base, min_interval_s
     )
     return scanner
 
@@ -127,30 +127,72 @@ class _CentralAPI:
         self.expiry = 0.0
 
     async def _ensure_token(self):
+        # Nog geldig? (1 minuut speling)
         if self.access_token and time.time() < self.expiry - 60:
             return
-        url = f"{self.oauth_base}/oauth2/token"
+
+        # 1) Primaire poging: region/OAuth-base met form-data (zoals jouw originele flow)
+        token_url = f"{self.oauth_base}/oauth2/token"
         data = {
             "grant_type": "refresh_token",
             "client_id": self.client_id,
             "client_secret": self.client_secret,
             "refresh_token": self.refresh_token,
         }
-        _LOGGER.warning("aruba_central(DeviceScanner): POST %s (OAuth refresh)", url)
-        async with self.s.post(url, data=data, timeout=30) as r:
-            body = await r.text()
-            if r.status != 200:
-                _LOGGER.error("aruba_central(DeviceScanner): token refresh failed %s: %s", r.status, body)
-                raise RuntimeError(f"Token refresh failed {r.status}: {body}")
-            try:
-                j = json.loads(body)
-            except Exception:
-                _LOGGER.error("aruba_central(DeviceScanner): token refresh invalid JSON: %s", body)
-                raise
+        _LOGGER.warning("aruba_central(DeviceScanner): POST %s (OAuth refresh, form-data)", token_url)
+        j, status, body = await self._post_json(token_url, data=data, use_basic_auth=False)
+
+        # 2) Fallback: dezelfde URL maar BasicAuth (sommige tenants vereisen dit)
+        if not j and status in (400, 401):
+            _LOGGER.warning("aruba_central(DeviceScanner): retry OAuth with BasicAuth on same endpoint")
+            j, status, body = await self._post_json(
+                token_url,
+                data={"grant_type": "refresh_token", "refresh_token": self.refresh_token},
+                use_basic_auth=True,
+            )
+
+        # 3) Fallback: global oauth host – sommige oudere tokens zijn hieraan gebonden
+        if not j and status in (400, 401):
+            global_oauth = "https://oauth2.central.arubanetworks.com/oauth2/token"
+            _LOGGER.warning("aruba_central(DeviceScanner): retry OAuth on global endpoint %s", global_oauth)
+            j, status, body = await self._post_json(
+                global_oauth,
+                data={
+                    "grant_type": "refresh_token",
+                    "client_id": self.client_id,
+                    "client_secret": self.client_secret,
+                    "refresh_token": self.refresh_token,
+                },
+                use_basic_auth=False,
+            )
+
+        if not j:
+            # Laat originele fout zien (geen onterechte 'invalid token' claim als endpoint/flow het issue is)
+            msg = body or f"HTTP {status}"
+            _LOGGER.error("aruba_central(DeviceScanner): token refresh failed: %s", msg)
+            raise RuntimeError(f"Token refresh failed: {msg}")
+
         self.access_token = j.get("access_token")
         self.refresh_token = j.get("refresh_token", self.refresh_token)
         self.expiry = time.time() + int(j.get("expires_in", 3600))
         _LOGGER.warning("aruba_central(DeviceScanner): token ok; expires_in=%s", j.get("expires_in"))
+
+    async def _post_json(self, url: str, *, data: Dict[str, Any], use_basic_auth: bool) -> tuple[Optional[Dict[str, Any]], int, str]:
+        auth = aiohttp.BasicAuth(self.client_id, self.client_secret) if use_basic_auth else None
+        try:
+            async with self.s.post(url, data=data, auth=auth, timeout=30) as r:
+                body = await r.text()
+                if r.status != 200:
+                    return None, r.status, body
+                try:
+                    j = json.loads(body)
+                    return j, r.status, body
+                except Exception:
+                    _LOGGER.error("aruba_central(DeviceScanner): token refresh invalid JSON: %s", body)
+                    return None, r.status, body
+        except Exception as e:
+            _LOGGER.error("aruba_central(DeviceScanner): token refresh exception: %s", e)
+            return None, 0, str(e)
 
     def _headers(self) -> Dict[str, str]:
         h = {"Authorization": f"Bearer {self.access_token}"}
@@ -248,10 +290,9 @@ class ArubaCentralScanner(DeviceScanner):
     async def _fetch_if_needed(self):
         now = time.time()
         age = now - self._last_fetch_ts if self._last_fetch_ts else 1e9
-        next_due = (self._last_fetch_ts + self._min_interval_s) if self._last_fetch_ts else 0
         if self._last_fetch_ts and age < self._min_interval_s:
             _LOGGER.warning(
-                "aruba_central(DeviceScanner): skip API (age=%ss < min=%ss, next_due=+%ss)",
+                "aruba_central(DeviceScanner): skip API (age=%ss < min=%ss, next_in=%ss)",
                 int(age),
                 self._min_interval_s,
                 int(self._min_interval_s - age),
@@ -301,10 +342,9 @@ class ArubaCentralScanner(DeviceScanner):
             if not mac:
                 continue
             macs.append(mac)
-            self._last_by_mac[mac] = {
-                "ip": c.get("ipaddr") or c.get("ip_address"),
-                "name": c.get("name") or c.get("hostname") or mac,
-            }
+            name = c.get("name") or c.get("hostname") or mac
+            ip = c.get("ipaddr") or c.get("ip_address")
+            self._last_by_mac[mac] = {"name": name, "ip": ip}
         return macs
 
     async def async_get_device_name(self, device: str) -> Optional[str]:
