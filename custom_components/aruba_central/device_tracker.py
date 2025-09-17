@@ -5,13 +5,15 @@ import aiohttp
 import async_timeout
 import voluptuous as vol
 from homeassistant.components.device_tracker import DOMAIN
+from homeassistant.const import CONF_SCAN_INTERVAL
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.util import slugify
 
 _LOGGER = logging.getLogger(__name__)
 
-SCAN_INTERVAL = timedelta(seconds=60)
+DEFAULT_SCAN_INTERVAL_S = 60
+SCAN_INTERVAL = timedelta(seconds=DEFAULT_SCAN_INTERVAL_S)
 
 CONFIG_SCHEMA = vol.Schema({
     DOMAIN: vol.Schema({
@@ -21,6 +23,7 @@ CONFIG_SCHEMA = vol.Schema({
         vol.Required("customer_id"): str,
         vol.Required("group"): str,
         vol.Required("api_base"): str,
+        vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL_S): vol.Any(int),
     })
 }, extra=vol.ALLOW_EXTRA)
 
@@ -39,6 +42,7 @@ class ArubaCentralScanner:
         self._customer_id = config["customer_id"]
         self._group = config["group"]
         self._api_base = config["api_base"]
+        self._scan_interval = timedelta(seconds=config.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_S))
 
         self._access_token = None
         self._last_fetch = None
@@ -50,7 +54,7 @@ class ArubaCentralScanner:
     async def async_initialize(self):
         await self._refresh_access_token()
         async_track_time_interval(
-            self._hass, self._scheduled_update, SCAN_INTERVAL
+            self._hass, self._scheduled_update, self._scan_interval
         )
 
     async def _scheduled_update(self, now):
@@ -72,7 +76,7 @@ class ArubaCentralScanner:
         return None
 
     async def _maybe_update_clients(self):
-        if not self._last_fetch or (datetime.utcnow() - self._last_fetch) > SCAN_INTERVAL:
+        if not self._last_fetch or (datetime.utcnow() - self._last_fetch) > self._scan_interval:
             await self._update_clients()
         else:
             _LOGGER.debug("Using cached client data")
@@ -116,7 +120,7 @@ class ArubaCentralScanner:
 
     def _expire_old_devices(self):
         now = datetime.utcnow()
-        timeout = SCAN_INTERVAL.total_seconds() + 30
+        timeout = self._scan_interval.total_seconds() + 30
         expired = [mac for mac, last in self._last_seen.items() if (now - last).total_seconds() > timeout]
         for mac in expired:
             self._last_by_mac.pop(mac, None)
