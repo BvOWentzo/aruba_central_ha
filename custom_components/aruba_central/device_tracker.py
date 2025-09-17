@@ -28,8 +28,7 @@ CONFIG_SCHEMA = vol.Schema({
 }, extra=vol.ALLOW_EXTRA)
 
 async def async_get_scanner(hass, config):
-    conf = config[DOMAIN]
-    scanner = ArubaCentralScanner(hass, conf)
+    scanner = ArubaCentralScanner(hass, config)
     await scanner.async_initialize()
     return scanner
 
@@ -74,6 +73,20 @@ class ArubaCentralScanner:
         if client:
             return client.get("hostname") or client.get("ip_address")
         return None
+
+    async def async_get_extra_attributes(self, device):
+        client = self._last_by_mac.get(device.upper())
+        if not client:
+            return {}
+        return {
+            "ip": client.get("ip_address"),
+            "hostname": client.get("hostname"),
+            "os": client.get("os_type"),
+            "ap_name": client.get("ap_name"),
+            "band": client.get("band"),
+            "rssi": client.get("rssi"),
+            "connected_time": client.get("connected_time")
+        }
 
     async def _maybe_update_clients(self):
         if not self._last_fetch or (datetime.utcnow() - self._last_fetch) > self._scan_interval:
