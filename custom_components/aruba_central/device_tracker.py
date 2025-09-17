@@ -1,6 +1,7 @@
-
+# /config/custom_components/aruba_central/device_tracker.py
 from __future__ import annotations
 
+import json
 import logging
 import time
 from datetime import timedelta
@@ -21,22 +22,22 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.warning("aruba_central(DeviceScanner): module import OK")
 
-
+# Laat HA ons elke 60s aanroepen i.p.v. ~12s
 SCAN_INTERVAL = timedelta(seconds=60)
 
 CONF_CLIENT_ID = "client_id"
 CONF_CLIENT_SECRET = "client_secret"
 CONF_REFRESH_TOKEN = "refresh_token"
-CONF_CUSTOMER_ID = "customer_id"      # optioneel (MSP -> TenantID header)
-CONF_API_BASE = "api_base"            # bv. https://eu-apigw.central.arubanetworks.com
-CONF_OAUTH_BASE = "oauth_base"        # optioneel; default = api_base
-CONF_GROUP = "group"                  # optioneel (naam of GUID)
-CONF_SITE = "site"                    # optioneel
-CONF_CLIENT_TYPE = "client_type"      # WIRELESS | WIRED | ALL
+CONF_CUSTOMER_ID = "customer_id"
+CONF_API_BASE = "api_base"
+CONF_OAUTH_BASE = "oauth_base"
+CONF_GROUP = "group"
+CONF_SITE = "site"
+CONF_CLIENT_TYPE = "client_type"
 CONF_SCAN_INTERVAL = "scan_interval"  # throttle voor Central API (sec/timedelta/HH:MM:SS)
 
 DEFAULT_CLIENT_TYPE = "WIRELESS"
-DEFAULT_SCAN_INTERVAL_S = 60  # default throttle voor Central-API
+DEFAULT_SCAN_INTERVAL_S = 60
 
 PLATFORM_SCHEMA = BASE_PLATFORM_SCHEMA.extend(
     {
@@ -49,7 +50,6 @@ PLATFORM_SCHEMA = BASE_PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_GROUP): cv.string,
         vol.Optional(CONF_SITE): cv.string,
         vol.Optional(CONF_CLIENT_TYPE, default=DEFAULT_CLIENT_TYPE): vol.In(["WIRELESS", "WIRED", "ALL"]),
-        # YAML: scan_interval accepteert int (seconden), time-period of "HH:MM:SS"
         vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL_S): vol.Any(
             cv.positive_int, cv.time_period, cv.time_period_str
         ),
@@ -57,7 +57,6 @@ PLATFORM_SCHEMA = BASE_PLATFORM_SCHEMA.extend(
 )
 
 def _flatten_conf(config: dict) -> dict:
-    """Ondersteun zowel platte config als {device_tracker: {...}} van legacy loader."""
     if DEVICE_TRACKER_DOMAIN in config and isinstance(config[DEVICE_TRACKER_DOMAIN], dict):
         return config[DEVICE_TRACKER_DOMAIN]
     return config
@@ -65,19 +64,18 @@ def _flatten_conf(config: dict) -> dict:
 async def async_get_scanner(hass: HomeAssistant, config: dict) -> Optional[DeviceScanner]:
     _LOGGER.warning("aruba_central(DeviceScanner): async_get_scanner START")
     conf = _flatten_conf(config)
-
     for k in (CONF_CLIENT_ID, CONF_CLIENT_SECRET, CONF_REFRESH_TOKEN, CONF_API_BASE):
         if k not in conf:
             _LOGGER.error("aruba_central(DeviceScanner): missing required option: %s", k)
             return None
 
-    # Normaliseer YAML scan_interval -> seconden
+    # YAML scan_interval → throttle voor de Central API
     si = conf.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_S)
     if isinstance(si, int):
         min_interval_s = si
     elif isinstance(si, str):
         min_interval_s = int(cv.time_period_str(si).total_seconds())
-    else:  # timedelta
+    else:
         min_interval_s = int(si.total_seconds())
     if min_interval_s < 5:
         min_interval_s = 5
@@ -100,14 +98,24 @@ async def async_get_scanner(hass: HomeAssistant, config: dict) -> Optional[Devic
         min_interval_s=min_interval_s,
     )
     await scanner.async_init()
-    _LOGGER.warning("aruba_central(DeviceScanner): async_get_scanner DONE (min_interval_s=%s)", min_interval_s)
+    _LOGGER.warning(
+        "aruba_central(DeviceScanner): async_get_scanner DONE (api_base=%s, min_interval_s=%s)",
+        api_base, min_interval_s
+    )
     return scanner
 
 
-# ---------- Central API helper ----------
 class _CentralAPI:
-    def __init__(self, session: aiohttp.ClientSession, api_base: str, oauth_base: str,
-                 client_id: str, client_secret: str, refresh_token: str, customer_id: Optional[str]):
+    def __init__(
+        self,
+        session: aiohttp.ClientSession,
+        api_base: str,
+        oauth_base: str,
+        client_id: str,
+        client_secret: str,
+        refresh_token: str,
+        customer_id: Optional[str],
+    ):
         self.s = session
         self.api_base = api_base
         self.oauth_base = oauth_base
@@ -119,7 +127,6 @@ class _CentralAPI:
         self.expiry = 0.0
 
     async def _ensure_token(self):
-        # vernieuw 60s vóór expiry
         if self.access_token and time.time() < self.expiry - 60:
             return
         url = f"{self.oauth_base}/oauth2/token"
@@ -131,23 +138,29 @@ class _CentralAPI:
         }
         _LOGGER.warning("aruba_central(DeviceScanner): POST %s (OAuth refresh)", url)
         async with self.s.post(url, data=data, timeout=30) as r:
-            txt = await r.text()
+            body = await r.text()
             if r.status != 200:
-                _LOGGER.error("aruba_central(DeviceScanner): token refresh failed %s: %s", r.status, txt)
-                raise RuntimeError(f"Token refresh failed {r.status}: {txt}")
-            j = await r.json()
+                _LOGGER.error("aruba_central(DeviceScanner): token refresh failed %s: %s", r.status, body)
+                raise RuntimeError(f"Token refresh failed {r.status}: {body}")
+            try:
+                j = json.loads(body)
+            except Exception:
+                _LOGGER.error("aruba_central(DeviceScanner): token refresh invalid JSON: %s", body)
+                raise
         self.access_token = j.get("access_token")
-        self.refresh_token = j.get("refresh_token", self.refresh_token)  # rotatie mogelijk
+        self.refresh_token = j.get("refresh_token", self.refresh_token)
         self.expiry = time.time() + int(j.get("expires_in", 3600))
         _LOGGER.warning("aruba_central(DeviceScanner): token ok; expires_in=%s", j.get("expires_in"))
 
     def _headers(self) -> Dict[str, str]:
         h = {"Authorization": f"Bearer {self.access_token}"}
         if self.customer_id:
-            h["TenantID"] = self.customer_id  # MSP header
+            h["TenantID"] = self.customer_id
         return h
 
-    async def list_clients(self, *, group: Optional[str], site: Optional[str], client_type: str) -> List[Dict[str, Any]]:
+    async def list_clients(
+        self, *, group: Optional[str], site: Optional[str], client_type: str
+    ) -> List[Dict[str, Any]]:
         await self._ensure_token()
         url = f"{self.api_base}/monitoring/v2/clients"
         params: Dict[str, Any] = {"client_status": "CONNECTED", "limit": 1000}
@@ -166,11 +179,15 @@ class _CentralAPI:
                 q["last_client_mac"] = last
             _LOGGER.warning("aruba_central(DeviceScanner): GET %s params=%s", url, q)
             async with self.s.get(url, headers=self._headers(), params=q, timeout=30) as r:
-                txt = await r.text()
+                body = await r.text()
                 if r.status != 200:
-                    _LOGGER.error("aruba_central(DeviceScanner): clients fetch failed %s: %s", r.status, txt)
-                    raise RuntimeError(f"clients fetch failed {r.status}: {txt}")
-                data = await r.json()
+                    _LOGGER.error("aruba_central(DeviceScanner): clients fetch failed %s: %s", r.status, body)
+                    raise RuntimeError(f"clients fetch failed {r.status}: {body}")
+                try:
+                    data = json.loads(body)
+                except Exception:
+                    _LOGGER.error("aruba_central(DeviceScanner): clients fetch invalid JSON: %s", body)
+                    raise
             chunk = data.get("data") or data.get("clients") or []
             items.extend(chunk)
             last = data.get("last_client_mac")
@@ -180,13 +197,22 @@ class _CentralAPI:
         return items
 
 
-# ---------- DeviceScanner met throttle ----------
 class ArubaCentralScanner(DeviceScanner):
-    """AOS8-achtig: levert alleen MAC-adressen. Presence is 'home' als MAC in laatste fetch zat; anders 'not_home'."""
-
-    def __init__(self, *, session: aiohttp.ClientSession, api_base: str, oauth_base: str,
-                 client_id: str, client_secret: str, refresh_token: str, customer_id: Optional[str],
-                 group: Optional[str], site: Optional[str], client_type: str, min_interval_s: int):
+    def __init__(
+        self,
+        *,
+        session: aiohttp.ClientSession,
+        api_base: str,
+        oauth_base: str,
+        client_id: str,
+        client_secret: str,
+        refresh_token: str,
+        customer_id: Optional[str],
+        group: Optional[str],
+        site: Optional[str],
+        client_type: str,
+        min_interval_s: int,
+    ):
         self._api = _CentralAPI(
             session=session,
             api_base=api_base,
@@ -207,7 +233,12 @@ class ArubaCentralScanner(DeviceScanner):
     async def async_init(self):
         _LOGGER.warning(
             "aruba_central(DeviceScanner): init api_base=%s, oauth_base=%s, group=%s, site=%s, type=%s, min_interval_s=%s",
-            self._api.api_base, self._api.oauth_base, self._group, self._site, self._client_type, self._min_interval_s
+            self._api.api_base,
+            self._api.oauth_base,
+            self._group,
+            self._site,
+            self._client_type,
+            self._min_interval_s,
         )
         try:
             await self._api._ensure_token()
@@ -216,17 +247,47 @@ class ArubaCentralScanner(DeviceScanner):
 
     async def _fetch_if_needed(self):
         now = time.time()
-        age = now - self._last_fetch_ts
-        # Skip tot throttle verstreken is (ongeacht cache-inhoud) → harde interval conform YAML
+        age = now - self._last_fetch_ts if self._last_fetch_ts else 1e9
+        next_due = (self._last_fetch_ts + self._min_interval_s) if self._last_fetch_ts else 0
         if self._last_fetch_ts and age < self._min_interval_s:
-            _LOGGER.warning("aruba_central(DeviceScanner): skip API (age=%ss < min=%ss)", int(age), self._min_interval_s)
+            _LOGGER.warning(
+                "aruba_central(DeviceScanner): skip API (age=%ss < min=%ss, next_due=+%ss)",
+                int(age),
+                self._min_interval_s,
+                int(self._min_interval_s - age),
+            )
             return
-        clients = await self._api.list_clients(group=self._group, site=self._site, client_type=self._client_type)
+
+        _LOGGER.warning(
+            "aruba_central(DeviceScanner): calling Central API (age=%ss, min=%ss)",
+            0 if age == 1e9 else int(age),
+            self._min_interval_s,
+        )
+        clients = await self._api.list_clients(
+            group=self._group, site=self._site, client_type=self._client_type
+        )
         self._cache_clients = clients
         self._last_fetch_ts = now
         _LOGGER.warning("aruba_central(DeviceScanner): fetched %s clients (API)", len(clients))
 
     async def async_scan_devices(self) -> List[str]:
+        poll_ts = time.time()
+        # Log elke HA-poll met inzicht in throttle
+        if self._last_fetch_ts:
+            age = poll_ts - self._last_fetch_ts
+            _LOGGER.warning(
+                "aruba_central(DeviceScanner): HA poll @%s; last_fetch_age=%ss; throttle=%ss",
+                int(poll_ts),
+                int(age),
+                self._min_interval_s,
+            )
+        else:
+            _LOGGER.warning(
+                "aruba_central(DeviceScanner): HA poll @%s; no previous fetch; throttle=%ss",
+                int(poll_ts),
+                self._min_interval_s,
+            )
+
         try:
             await self._fetch_if_needed()
             clients = list(self._cache_clients)
@@ -253,6 +314,6 @@ class ArubaCentralScanner(DeviceScanner):
     async def async_get_extra_attributes(self, device: str) -> Dict[str, Any]:
         info = self._last_by_mac.get(device.lower()) or {}
         out: Dict[str, Any] = {"mac": device.lower()}
-        if "ip" in info and info["ip"]:
+        if info.get("ip"):
             out["ip"] = info["ip"]
         return out
