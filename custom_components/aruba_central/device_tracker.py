@@ -1,10 +1,11 @@
+# -*- coding: utf-8 -*-
 # /config/custom_components/aruba_central/device_tracker.py
-from __future__ import annotations
 
 import json
 import logging
 import time
 from datetime import timedelta
+
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -19,9 +20,9 @@ from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 _LOGGER = logging.getLogger(__name__)
-_LOGGER.warning("aruba_central(DeviceScanner): module import OK (minimal throttle build)")
+_LOGGER.warning("aruba_central(DeviceScanner): module import OK (compat build)")
 
-# Laat HA ons ~1×/min aanroepen i.p.v. ~12s
+# Let HA poll ~1/min instead of ~12s
 SCAN_INTERVAL = timedelta(seconds=60)
 
 CONF_CLIENT_ID = "client_id"
@@ -33,10 +34,38 @@ CONF_OAUTH_BASE = "oauth_base"
 CONF_GROUP = "group"
 CONF_SITE = "site"
 CONF_CLIENT_TYPE = "client_type"
-CONF_SCAN_INTERVAL = "scan_interval"  # throttle Central API (sec/timedelta/HH:MM:SS)
+CONF_SCAN_INTERVAL = "scan_interval"  # Central API throttle
 
 DEFAULT_CLIENT_TYPE = "WIRELESS"
 DEFAULT_SCAN_INTERVAL_S = 60
+
+def _parse_scan_interval(si) -> int:
+    """Return seconds. Accepts int, timedelta, or 'HH:MM:SS' string."""
+    if isinstance(si, int):
+        return si
+    # timedelta
+    try:
+        return int(si.total_seconds())
+    except Exception:
+        pass
+    # string "HH:MM:SS" or "MM:SS" or "SS"
+    if isinstance(si, str):
+        parts = si.strip().split(":")
+        try:
+            parts = [int(p) for p in parts]
+        except ValueError:
+            raise vol.Invalid("scan_interval string must be 'HH:MM:SS' or 'MM:SS' or 'SS'")
+        if len(parts) == 1:
+            return parts[0]
+        if len(parts) == 2:
+            m, s = parts
+            return m*60 + s
+        if len(parts) == 3:
+            h, m, s = parts
+            return h*3600 + m*60 + s
+        raise vol.Invalid("scan_interval string has too many components")
+    # fallback
+    raise vol.Invalid("scan_interval must be int, timedelta or time string")
 
 PLATFORM_SCHEMA = BASE_PLATFORM_SCHEMA.extend(
     {
@@ -49,23 +78,23 @@ PLATFORM_SCHEMA = BASE_PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_GROUP): cv.string,
         vol.Optional(CONF_SITE): cv.string,
         vol.Optional(CONF_CLIENT_TYPE, default=DEFAULT_CLIENT_TYPE): vol.In(["WIRELESS", "WIRED", "ALL"]),
+        # Accept int / timedelta / string; we'll parse string ourselves
         vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL_S): vol.Any(
-            cv.positive_int, cv.time_period, cv.time_period_str
+            cv.positive_int, cv.time_period, cv.string
         ),
     }
 )
 
 async def async_get_scanner(hass: HomeAssistant, config: dict) -> Optional[DeviceScanner]:
-    _LOGGER.warning("aruba_central(DeviceScanner): async_get_scanner START (minimal throttle)")
+    _LOGGER.warning("aruba_central(DeviceScanner): async_get_scanner START (compat build)")
 
-    # YAML scan_interval → throttle voor de Central API
+    # YAML scan_interval -> throttle for Central API
     si = config.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_S)
-    if isinstance(si, int):
-        min_interval_s = si
-    elif isinstance(si, str):
-        min_interval_s = int(cv.time_period_str(si).total_seconds())
-    else:
-        min_interval_s = int(si.total_seconds())
+    try:
+        min_interval_s = _parse_scan_interval(si)
+    except Exception as e:
+        _LOGGER.error("aruba_central(DeviceScanner): invalid scan_interval %r: %s", si, e)
+        return None
     if min_interval_s < 5:
         min_interval_s = 5
 
@@ -218,18 +247,18 @@ class ArubaCentralScanner(DeviceScanner):
     async def async_scan_devices(self) -> List[str]:
         now = time.time()
 
-        # Beslissingslogging
+        # Decision logging
         if self._last_fetch_ts == 0:
-            _LOGGER.warning("aruba_central(DeviceScanner): DECISION first-run → call Central now")
+            _LOGGER.warning("aruba_central(DeviceScanner): DECISION first-run -> call Central now")
             do_call = True
         else:
             age = now - self._last_fetch_ts
             if age >= self._min_interval_s:
-                _LOGGER.warning("aruba_central(DeviceScanner): DECISION age=%ss >= min=%ss → call Central",
+                _LOGGER.warning("aruba_central(DeviceScanner): DECISION age=%ss >= min=%ss -> call Central",
                                 int(age), self._min_interval_s)
                 do_call = True
             else:
-                _LOGGER.warning("aruba_central(DeviceScanner): DECISION age=%ss < min=%ss → use cache",
+                _LOGGER.warning("aruba_central(DeviceScanner): DECISION age=%ss < min=%ss -> use cache",
                                 int(age), self._min_interval_s)
                 do_call = False
 
@@ -252,7 +281,7 @@ class ArubaCentralScanner(DeviceScanner):
                             "name": c.get("name") or c.get("hostname") or mac,
                         }
             except Exception as e:
-                # Note: backoff: beschouw dit als fetch-tijdstip om 12s retry-stormen te voorkomen
+                # Backoff: prevent 12s retry storms
                 self._last_fetch_ts = now
                 _LOGGER.error("aruba_central(DeviceScanner): API error; backing off %ss: %s",
                               self._min_interval_s, e)
