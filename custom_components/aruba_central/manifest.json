@@ -1,7 +1,7 @@
 {
   "domain": "aruba_central",
   "name": "Aruba Central Device Tracker",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "documentation": "https://github.com/BvOWentzo/aruba_central_ha",
   "requirements": [],
   "codeowners": ["@BvOWentzo"],
