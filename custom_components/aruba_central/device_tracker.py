@@ -1,5 +1,3 @@
-
-# -*- coding: utf-8 -*-
 import json
 import time
 import logging
@@ -34,7 +32,7 @@ CONF_SCAN_INTERVAL = "scan_interval"
 DEFAULT_CLIENT_TYPE = "WIRELESS"
 DEFAULT_SCAN_INTERVAL = 60
 
-SCAN_INTERVAL = timedelta(seconds=60)  # force HA to poll every 60s
+SCAN_INTERVAL = timedelta(seconds=60)
 
 PLATFORM_SCHEMA = BASE_PLATFORM_SCHEMA.extend({
     vol.Required(CONF_CLIENT_ID): cv.string,
@@ -90,6 +88,7 @@ class ArubaCentralScanner(DeviceScanner):
     async def _ensure_token(self):
         now = time.time()
         if self._access_token and now < self._token_expiry - 60:
+            _LOGGER.warning("aruba_central(DeviceScanner): using cached token")
             return
 
         url = f"{self._oauth_base}/oauth2/token"
@@ -100,21 +99,26 @@ class ArubaCentralScanner(DeviceScanner):
             "refresh_token": self._refresh_token
         }
 
-        _LOGGER.warning("aruba_central(DeviceScanner): refreshing token from %s", url)
-        async with self._session.post(url, data=data) as resp:
-            if resp.status != 200:
+        _LOGGER.warning("aruba_central(DeviceScanner): requesting new token from %s", url)
+        try:
+            async with self._session.post(url, data=data) as resp:
                 text = await resp.text()
-                _LOGGER.error("aruba_central(DeviceScanner): token refresh failed: %s", text)
-                raise Exception(f"Token refresh failed: {text}")
-            result = await resp.json()
-            self._access_token = result["access_token"]
-            self._refresh_token = result.get("refresh_token", self._refresh_token)
-            self._token_expiry = time.time() + result.get("expires_in", 3600)
-            _LOGGER.warning("aruba_central(DeviceScanner): token ok, expires in %ss", result.get("expires_in", 3600))
+                _LOGGER.warning("aruba_central(DeviceScanner): token POST status %s: %s", resp.status, text)
+                if resp.status != 200:
+                    raise Exception(f"Token refresh failed: {text}")
+                result = json.loads(text)
+                self._access_token = result["access_token"]
+                self._refresh_token = result.get("refresh_token", self._refresh_token)
+                self._token_expiry = time.time() + result.get("expires_in", 3600)
+        except Exception as e:
+            _LOGGER.error("aruba_central(DeviceScanner): token refresh EXCEPTION: %s", e)
+            raise
 
     async def async_scan_devices(self) -> List[str]:
         now = time.time()
         age = now - self._last_fetch
+
+        _LOGGER.warning("aruba_central(DeviceScanner): scan called at %.1f (age: %.1fs)", now, age)
 
         if self._last_fetch == 0:
             _LOGGER.warning("aruba_central(DeviceScanner): DECISION first run → call Central")
@@ -141,9 +145,13 @@ class ArubaCentralScanner(DeviceScanner):
             elif self._site:
                 params["site"] = self._site
 
-            _LOGGER.warning("aruba_central(DeviceScanner): fetching clients from Central: %s", url)
+            _LOGGER.warning("aruba_central(DeviceScanner): GET %s with headers %s and params %s", url, headers, params)
             async with self._session.get(url, headers=headers, params=params) as resp:
-                data = await resp.json()
+                text = await resp.text()
+                _LOGGER.warning("aruba_central(DeviceScanner): API status %s: %s", resp.status, text)
+                if resp.status != 200:
+                    raise Exception(f"Central fetch failed: {text}")
+                data = json.loads(text)
                 self._cached_clients = data.get("data", []) or data.get("clients", [])
                 self._last_fetch = now
                 self._clients_by_mac = {
@@ -153,9 +161,8 @@ class ArubaCentralScanner(DeviceScanner):
                     }
                     for c in self._cached_clients if "macaddr" in c
                 }
-                _LOGGER.warning("aruba_central(DeviceScanner): fetched %s clients", len(self._cached_clients))
         except Exception as e:
-            _LOGGER.error("aruba_central(DeviceScanner): fetch error: %s", e)
+            _LOGGER.error("aruba_central(DeviceScanner): scan error: %s", e)
 
         return list(self._clients_by_mac.keys())
 
