@@ -10,12 +10,12 @@ import voluptuous as vol
 
 from homeassistant.components.device_tracker import PLATFORM_SCHEMA as BASE_PLATFORM_SCHEMA
 from homeassistant.components.device_tracker import DeviceScanner
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.core import HomeAssistant
 
 _LOGGER = logging.getLogger(__name__)
-_LOGGER.warning("aruba_central(DeviceScanner): module import OK")  # hoor je altijd bij succesvol laden
+_LOGGER.warning("aruba_central(DeviceScanner): module import OK")  # zichtbare log bij succesvol import
 
 # ---- Config ----
 CONF_CLIENT_ID = "client_id"
@@ -27,7 +27,6 @@ CONF_OAUTH_BASE = "oauth_base"        # optioneel; default = api_base
 CONF_GROUP = "group"                  # optioneel (naam of GUID)
 CONF_SITE = "site"                    # optioneel
 CONF_CLIENT_TYPE = "client_type"      # WIRELESS | WIRED | ALL
-
 DEFAULT_CLIENT_TYPE = "WIRELESS"
 
 PLATFORM_SCHEMA = BASE_PLATFORM_SCHEMA.extend(
@@ -41,16 +40,17 @@ PLATFORM_SCHEMA = BASE_PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_GROUP): cv.string,
         vol.Optional(CONF_SITE): cv.string,
         vol.Optional(CONF_CLIENT_TYPE, default=DEFAULT_CLIENT_TYPE): vol.In(["WIRELESS", "WIRED", "ALL"]),
-        # GEEN scan_interval hier: DeviceScanner timing regelt HA zelf, zoals bij AOS8.
+        # GEEN scan_interval hier: DeviceScanner timing regelt HA zelf (zoals AOS8).
     }
 )
 
 async def async_get_scanner(hass: HomeAssistant, config: dict) -> DeviceScanner:
-    """Wordt door HA aangeroepen; geef een DeviceScanner terug."""
+    """Door HA aangeroepen; geef een DeviceScanner terug."""
     _LOGGER.warning("aruba_central(DeviceScanner): async_get_scanner START")
     session = async_get_clientsession(hass)
+
     api_base = config[CONF_API_BASE].rstrip("/")
-    oauth_base = (config.get(CONF_OAUTH_BASE) or api_base).rstrip("/")
+    oauth_base = (config.get(CONF_OAUTH_BASE) or api_base).rstrip("/")  # default naar api_base
 
     scanner = ArubaCentralScanner(
         session=session,
@@ -147,13 +147,63 @@ class _CentralAPI:
 
 # ---------- De echte DeviceScanner ----------
 class ArubaCentralScanner(DeviceScanner):
-    """AOS8-achtige scanner: levert alleen MAC-adressen; HA beheert presence-entities."""
+    """AOS8-achtige scanner: alleen MAC-adressen; HA maakt device_tracker-entiteiten."""
 
-    def __init__(self, **kw):
+    def __init__(self, *, session: aiohttp.ClientSession, api_base: str, oauth_base: str,
+                 client_id: str, client_secret: str, refresh_token: str, customer_id: Optional[str],
+                 group: Optional[str], site: Optional[str], client_type: str):
         self._api = _CentralAPI(
-            session=kw["session"],
-            api_base=kw["api_base"],
-            oauth_base=kw["oauth_base"],
-            client_id=kw["client_id"],
-            client_secret=kw["client_secret"],
-            refresh_token=kw["refr]()_
+            session=session,
+            api_base=api_base,
+            oauth_base=oauth_base,
+            client_id=client_id,
+            client_secret=client_secret,
+            refresh_token=refresh_token,
+            customer_id=customer_id,
+        )
+        self._group = group
+        self._site = site
+        self._client_type = client_type
+        self._last_by_mac: Dict[str, Dict[str, Any]] = {}
+
+    async def async_init(self):
+        _LOGGER.warning(
+            "aruba_central(DeviceScanner): init api_base=%s, oauth_base=%s, group=%s, site=%s, type=%s",
+            self._api.api_base, self._api.oauth_base, self._group, self._site, self._client_type
+        )
+        try:
+            await self._api._ensure_token()  # meteen duidelijke log
+        except Exception as e:
+            _LOGGER.error("aruba_central(DeviceScanner): initial token refresh failed: %s", e)
+
+    async def async_scan_devices(self) -> List[str]:
+        """Retourneer lijst met MACs (lowercase)."""
+        try:
+            clients = await self._api.list_clients(group=self._group, site=self._site, client_type=self._client_type)
+        except Exception as e:
+            _LOGGER.error("aruba_central(DeviceScanner): scan failed: %s", e)
+            return []
+
+        macs: List[str] = []
+        for c in clients:
+            mac = (c.get("macaddr") or c.get("mac") or "")
+            mac = mac.lower()
+            if not mac:
+                continue
+            macs.append(mac)
+            self._last_by_mac[mac] = {
+                "ip": c.get("ipaddr") or c.get("ip_address"),
+                "name": c.get("name") or c.get("hostname") or mac,
+            }
+        return macs
+
+    async def async_get_device_name(self, device: str) -> Optional[str]:
+        info = self._last_by_mac.get(device.lower())
+        return info.get("name") if info else None
+
+    async def async_get_extra_attributes(self, device: str) -> Dict[str, Any]:
+        info = self._last_by_mac.get(device.lower()) or {}
+        out: Dict[str, Any] = {"mac": device.lower()}
+        if "ip" in info and info["ip"]:
+            out["ip"] = info["ip"]
+        return out
