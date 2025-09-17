@@ -231,10 +231,7 @@ class ArubaCentralScanner(DeviceScanner):
         self._last_fetch_ts: float = 0.0
         self._next_due_ts: float = 0.0   # cooldown/next fetch moment
         self._cache_clients: List[Dict[str, Any]] = []
-        self._last_by_mac: Dict[str, Dict[str, Any]] = {}
-        self._last_poll_ts: float = 0.0  # guard tegen ~12s HA polls
-
-    async def async_init(self):
+        self._last_by_mac: Dict[str, Dict[str, Any]] = {}async def async_init(self):
         _LOGGER.warning(
             "aruba_central(DeviceScanner): init api_base=%s, oauth_base=%s, group=%s, site=%s, type=%s, min_interval_s=%s",
             self._api.api_base,
@@ -247,12 +244,6 @@ class ArubaCentralScanner(DeviceScanner):
 
     async def _fetch_if_needed(self):
         now = time.time()
-
-        # Guard tegen snelle HA polls: doe alleen werk als >60s sinds vorige poll
-        if self._last_poll_ts and (now - self._last_poll_ts) < 60:
-            _LOGGER.warning("aruba_central(DeviceScanner): HA fast poll guard – returning cache only")
-            return
-
         # Respecteer cooldown/next_due (ook na fouten)
         if now < self._next_due_ts:
             _LOGGER.warning("aruba_central(DeviceScanner): skip API until next_due in %ss",
@@ -305,19 +296,18 @@ class ArubaCentralScanner(DeviceScanner):
 
     async def async_scan_devices(self) -> List[str]:
         now = time.time()
-        # Log elke HA-poll en update guard
-        if self._last_poll_ts:
-            age = now - self._last_poll_ts
+        # Log elke HA-poll met context over fetch-throttle
+        if self._last_fetch_ts:
+            age = now - self._last_fetch_ts
+            wait = int(self._next_due_ts - now) if now < self._next_due_ts else 0
             _LOGGER.warning(
-                "aruba_central(DeviceScanner): HA poll; prev_poll_age=%ss; throttle=%ss",
-                int(age), self._min_interval_s,
+                "aruba_central(DeviceScanner): HA poll; last_fetch_age=%ss; next_due_in=%ss; throttle=%ss",
+                int(age), max(0, wait), self._min_interval_s,
             )
         else:
             _LOGGER.warning("aruba_central(DeviceScanner): HA poll; first run; throttle=%ss",
                             self._min_interval_s)
-        self._last_poll_ts = now
-
-        await self._fetch_if_needed()
+await self._fetch_if_needed()
         macs: List[str] = []
         for c in self._cache_clients:
             mac = (c.get("macaddr") or c.get("mac") or "").lower()
