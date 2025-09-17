@@ -8,16 +8,19 @@ from typing import Any, Dict, List, Optional
 import aiohttp
 import voluptuous as vol
 
-from homeassistant.components.device_tracker import PLATFORM_SCHEMA as BASE_PLATFORM_SCHEMA
-from homeassistant.components.device_tracker import DeviceScanner
+from homeassistant.components.device_tracker import (
+    PLATFORM_SCHEMA as BASE_PLATFORM_SCHEMA,
+    DeviceScanner,
+    DOMAIN as DEVICE_TRACKER_DOMAIN,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 _LOGGER = logging.getLogger(__name__)
-_LOGGER.warning("aruba_central(DeviceScanner): module import OK")  # zichtbare log bij succesvol import
+_LOGGER.warning("aruba_central(DeviceScanner): module import OK")
 
-# ---- Config ----
+# ---- Config keys ----
 CONF_CLIENT_ID = "client_id"
 CONF_CLIENT_SECRET = "client_secret"
 CONF_REFRESH_TOKEN = "refresh_token"
@@ -40,29 +43,40 @@ PLATFORM_SCHEMA = BASE_PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_GROUP): cv.string,
         vol.Optional(CONF_SITE): cv.string,
         vol.Optional(CONF_CLIENT_TYPE, default=DEFAULT_CLIENT_TYPE): vol.In(["WIRELESS", "WIRED", "ALL"]),
-        # GEEN scan_interval hier: DeviceScanner timing regelt HA zelf (zoals AOS8).
+        # GEEN scan_interval: legacy DeviceScanner regelt polling (zoals AOS8)
     }
 )
 
-async def async_get_scanner(hass: HomeAssistant, config: dict) -> DeviceScanner:
-    """Door HA aangeroepen; geef een DeviceScanner terug."""
-    _LOGGER.warning("aruba_central(DeviceScanner): async_get_scanner START")
-    session = async_get_clientsession(hass)
+def _flatten_conf(config: dict) -> dict:
+    """Ondersteun zowel platte config als {device_tracker: ...} wrapper van legacy loader."""
+    if DEVICE_TRACKER_DOMAIN in config and isinstance(config[DEVICE_TRACKER_DOMAIN], dict):
+        return config[DEVICE_TRACKER_DOMAIN]
+    return config
 
-    api_base = config[CONF_API_BASE].rstrip("/")
-    oauth_base = (config.get(CONF_OAUTH_BASE) or api_base).rstrip("/")  # default naar api_base
+async def async_get_scanner(hass: HomeAssistant, config: dict) -> Optional[DeviceScanner]:
+    """HA roept dit aan; retourneer DeviceScanner of None bij fatale config-fout."""
+    _LOGGER.warning("aruba_central(DeviceScanner): async_get_scanner START")
+    conf = _flatten_conf(config)
+    missing = [k for k in (CONF_CLIENT_ID, CONF_CLIENT_SECRET, CONF_REFRESH_TOKEN, CONF_API_BASE) if k not in conf]
+    if missing:
+        _LOGGER.error("aruba_central(DeviceScanner): ontbrekende vereiste opties: %s", ", ".join(missing))
+        return None
+
+    session = async_get_clientsession(hass)
+    api_base = conf[CONF_API_BASE].rstrip("/")
+    oauth_base = (conf.get(CONF_OAUTH_BASE) or api_base).rstrip("/")  # default naar api_base
 
     scanner = ArubaCentralScanner(
         session=session,
         api_base=api_base,
         oauth_base=oauth_base,
-        client_id=config[CONF_CLIENT_ID],
-        client_secret=config[CONF_CLIENT_SECRET],
-        refresh_token=config[CONF_REFRESH_TOKEN],
-        customer_id=config.get(CONF_CUSTOMER_ID),
-        group=config.get(CONF_GROUP),
-        site=config.get(CONF_SITE),
-        client_type=config.get(CONF_CLIENT_TYPE, DEFAULT_CLIENT_TYPE),
+        client_id=conf[CONF_CLIENT_ID],
+        client_secret=conf[CONF_CLIENT_SECRET],
+        refresh_token=conf[CONF_REFRESH_TOKEN],
+        customer_id=conf.get(CONF_CUSTOMER_ID),
+        group=conf.get(CONF_GROUP),
+        site=conf.get(CONF_SITE),
+        client_type=conf.get(CONF_CLIENT_TYPE, DEFAULT_CLIENT_TYPE),
     )
     await scanner.async_init()
     _LOGGER.warning("aruba_central(DeviceScanner): async_get_scanner DONE")
