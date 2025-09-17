@@ -1,8 +1,8 @@
+# /config/custom_components/aruba_central/device_tracker.py
 from __future__ import annotations
 
 import logging
 import time
-from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -59,10 +59,10 @@ def _flatten_conf(config: dict) -> dict:
 async def async_get_scanner(hass: HomeAssistant, config: dict) -> Optional[DeviceScanner]:
     _LOGGER.warning("aruba_central(DeviceScanner): async_get_scanner START")
     conf = _flatten_conf(config)
-    missing = [k for k in (CONF_CLIENT_ID, CONF_CLIENT_SECRET, CONF_REFRESH_TOKEN, CONF_API_BASE) if k not in conf]
-    if missing:
-        _LOGGER.error("aruba_central(DeviceScanner): ontbrekende vereiste opties: %s", ", ".join(missing))
-        return None
+    for k in (CONF_CLIENT_ID, CONF_CLIENT_SECRET, CONF_REFRESH_TOKEN, CONF_API_BASE):
+        if k not in conf:
+            _LOGGER.error("aruba_central(DeviceScanner): missing required option: %s", k)
+            return None
 
     si = conf.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_S)
     if isinstance(si, int):
@@ -94,6 +94,7 @@ async def async_get_scanner(hass: HomeAssistant, config: dict) -> Optional[Devic
     await scanner.async_init()
     _LOGGER.warning("aruba_central(DeviceScanner): async_get_scanner DONE (min_interval_s=%s)", min_interval_s)
     return scanner
+
 
 class _CentralAPI:
     def __init__(self, session: aiohttp.ClientSession, api_base: str, oauth_base: str,
@@ -168,6 +169,7 @@ class _CentralAPI:
         _LOGGER.warning("aruba_central(DeviceScanner): total clients returned=%s", len(items))
         return items
 
+
 class ArubaCentralScanner(DeviceScanner):
     def __init__(self, *, session: aiohttp.ClientSession, api_base: str, oauth_base: str,
                  client_id: str, client_secret: str, refresh_token: str, customer_id: Optional[str],
@@ -201,8 +203,12 @@ class ArubaCentralScanner(DeviceScanner):
 
     async def _fetch_if_needed(self):
         now = time.time()
-        if now - self._last_fetch_ts < self._min_interval_s and self._cache_clients:
-            _LOGGER.warning("aruba_central(DeviceScanner): skip API (cache, age=%ss)", int(now - self._last_fetch_ts))
+        age = now - self._last_fetch_ts
+        if self._last_fetch_ts and age < self._min_interval_s:
+            _LOGGER.warning(
+                "aruba_central(DeviceScanner): skip API (age=%ss < min=%ss)",
+                int(age), self._min_interval_s
+            )
             return
         clients = await self._api.list_clients(group=self._group, site=self._site, client_type=self._client_type)
         self._cache_clients = clients
