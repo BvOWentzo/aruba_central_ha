@@ -209,51 +209,18 @@ class ArubaCentralScanner(DeviceScanner):
         if self._last_fetch_ts and age < self._min_interval_s:
             _LOGGER.warning("aruba_central(DeviceScanner): skip API (age=%ss < min=%ss)", int(age), self._min_interval_s)
             return
-        _LOGGER.warning("aruba_central(DeviceScanner): DECISION first run or min age met → call Central")
         clients = await self._api.list_clients(group=self._group, site=self._site, client_type=self._client_type)
         self._cache_clients = clients
         self._last_fetch_ts = now
         _LOGGER.warning("aruba_central(DeviceScanner): fetched %s clients (API)", len(clients))
 
-    
     async def async_scan_devices(self) -> List[str]:
-        now = time.time()
-        age = now - self._last_fetch_ts if self._last_fetch_ts else None
-
-        if self._last_fetch_ts and age < self._min_interval_s:
-            _LOGGER.warning("aruba_central(DeviceScanner): DECISION age=%ss < min=%ss → use cache", int(age), self._min_interval_s)
-            clients = self._clients
-        else:
-            _LOGGER.warning("aruba_central(DeviceScanner): DECISION first run or min age met → call Central")
-            clients = await self._api.list_clients(
-                group=self._group,
-                site=self._site,
-                client_type=self._client_type,
-            )
-            self._clients = clients
-            self._last_fetch_ts = now
-
-        seen_macs = set()
-        for client in clients:
-            mac = client.get("macaddr", "").lower()
-            if not mac:
-                continue
-            seen_macs.add(mac)
-            attrs = {
-                "ip": client.get("ip_address") or client.get("ipaddr"),
-                "ap_name": client.get("access_point_name"),
-                "essid": client.get("essid"),
-                "band": client.get("band"),
-            }
-            self.async_see(mac=mac, host_name=client.get("hostname") or mac, source_type="router", attributes=attrs)
-
-        # Detect disappeared clients
-        for mac in list(self._last_seen_macs):
-            if mac not in seen_macs:
-                self.async_see(mac=mac, source_type="router")
-
-        self._last_seen_macs = seen_macs
-        return list(seen_macs)
+        try:
+            await self._fetch_if_needed()
+            clients = list(self._cache_clients)
+        except Exception as e:
+            _LOGGER.error("aruba_central(DeviceScanner): scan failed: %s", e)
+            return []
 
         macs: List[str] = []
         for c in clients:
