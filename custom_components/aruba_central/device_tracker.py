@@ -5,14 +5,14 @@
 # handmatig in je config aan te passen.
 #
 # Bestand: custom_components/aruba_central/device_tracker.py
-# YAML-tokenbestand: /config/homeassistant/aruba_tokens.yaml
+# YAML-tokenbestand: homeassistant/aruba_tokens.yaml
 
 from __future__ import annotations
 
 import logging
 import time
 import os
-import yaml  # PyYAML is standaard geïnstalleerd in Home Assistant
+import yaml  
 from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
@@ -49,7 +49,7 @@ DEFAULT_CLIENT_TYPE = "WIRELESS"
 DEFAULT_SCAN_INTERVAL_S = 60
 
 # Token-bestand pad (in config dir)
-REFRESH_TOKEN_FILE = "/config/homeassistant/aruba_tokens.yaml"
+REFRESH_TOKEN_FILE = "homeassistant/aruba_tokens.yaml"
 
 def _flatten_conf(config: dict) -> dict:
     """Ondersteun zowel {device_tracker:{...}} als een platte dictionary."""
@@ -225,6 +225,4 @@ class _CentralAPI:
         items = data.get("data") or data.get("clients") or []
         return items
 
-# ArubaCentralScanner class blijft ongewijzigd verder — werkt al goed
-# Alleen de token handling is aangepast zoals hierboven
-# Eventuele updates daaraan kunnen we op verzoek ook documenteren
+
