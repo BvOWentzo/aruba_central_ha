@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import time
 import os
-import yaml  
+import yaml  # PyYAML is standaard geïnstalleerd in Home Assistant
 from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
@@ -48,17 +48,15 @@ CONF_SCAN_INTERVAL = "scan_interval"
 DEFAULT_CLIENT_TYPE = "WIRELESS"
 DEFAULT_SCAN_INTERVAL_S = 60
 
-# Token-bestand pad (in config dir)
+# Token-bestand pad (in juiste mapstructuur)
 REFRESH_TOKEN_FILE = "homeassistant/aruba_tokens.yaml"
 
 def _flatten_conf(config: dict) -> dict:
-    """Ondersteun zowel {device_tracker:{...}} als een platte dictionary."""
     if DEVICE_TRACKER_DOMAIN in config and isinstance(config[DEVICE_TRACKER_DOMAIN], dict):
         return config[DEVICE_TRACKER_DOMAIN]
     return config
 
 def _parse_scan_interval(val) -> int:
-    """Zorg dat de scan_interval altijd een geldig aantal seconden is."""
     if val is None:
         return DEFAULT_SCAN_INTERVAL_S
     if isinstance(val, int):
@@ -81,7 +79,7 @@ def _parse_scan_interval(val) -> int:
     except Exception:
         return DEFAULT_SCAN_INTERVAL_S
 
-# Validatie van configuratie in configuration.yaml
+# Configuratie validatie: refresh_token is optioneel (want we laden hem uit .yaml)
 PLATFORM_SCHEMA = BASE_PLATFORM_SCHEMA.extend(
     {
         vol.Required(CONF_CLIENT_ID): cv.string,
@@ -97,12 +95,11 @@ PLATFORM_SCHEMA = BASE_PLATFORM_SCHEMA.extend(
     }
 )
 
-# Wordt aangeroepen bij het opstarten van Home Assistant
 async def async_get_scanner(hass: HomeAssistant, config: dict) -> Optional[DeviceScanner]:
     _LOGGER.warning("aruba_central: async_get_scanner START")
     conf = _flatten_conf(config)
 
-    for k in (CONF_CLIENT_ID, CONF_CLIENT_SECRET, CONF_REFRESH_TOKEN, CONF_API_BASE):
+    for k in (CONF_CLIENT_ID, CONF_CLIENT_SECRET, CONF_API_BASE):
         if k not in conf:
             _LOGGER.error("aruba_central: ontbrekende configuratie-optie: %s", k)
             return None
@@ -121,7 +118,7 @@ async def async_get_scanner(hass: HomeAssistant, config: dict) -> Optional[Devic
         oauth_base=oauth_base,
         client_id=conf[CONF_CLIENT_ID],
         client_secret=conf[CONF_CLIENT_SECRET],
-        refresh_token=conf[CONF_REFRESH_TOKEN],  # Deze wordt mogelijk overschreven door YAML
+        refresh_token=conf.get(CONF_REFRESH_TOKEN, ""),
         customer_id=conf.get(CONF_CUSTOMER_ID),
         group=conf.get(CONF_GROUP),
         site=conf.get(CONF_SITE),
@@ -153,22 +150,23 @@ class _CentralAPI:
         self.expiry = 0.0
         self._refresh_token_file = REFRESH_TOKEN_FILE
 
-        # Probeer refresh_token te laden uit YAML-bestand
         if os.path.exists(self._refresh_token_file):
             try:
                 with open(self._refresh_token_file, "r") as f:
-                    yaml = yaml.safe_load(f) or {}
-                    self.refresh_token = yaml.get("refresh_token", refresh_token)
+                    yml = yaml.safe_load(f) or {}
+                    self.refresh_token = yml.get("refresh_token", refresh_token)
                     _LOGGER.warning("aruba_central: refresh_token geladen uit YAML")
             except Exception as e:
                 _LOGGER.error("aruba_central: fout bij lezen aruba_tokens.yaml: %s", e)
                 self.refresh_token = refresh_token
         else:
-            _LOGGER.warning("aruba_central: YAML-bestand niet gevonden, gebruik config-token")
+            _LOGGER.warning("aruba_central: YAML-bestand niet gevonden, gebruik token uit configuratie")
             self.refresh_token = refresh_token
 
+        if not self.refresh_token:
+            raise ValueError("Geen geldige refresh_token gevonden in configuratie of YAML-bestand")
+
     async def _ensure_token(self):
-        # Gebruik bestaande access token als deze nog geldig is
         if self.access_token and time.time() < self.expiry - 60:
             return
 
@@ -190,7 +188,6 @@ class _CentralAPI:
         self.refresh_token = j.get("refresh_token", self.refresh_token)
         self.expiry = time.time() + int(j.get("expires_in", 3600))
 
-        # Schrijf nieuwe refresh_token terug naar YAML-bestand
         try:
             with open(self._refresh_token_file, "w") as f:
                 yaml.dump({"refresh_token": self.refresh_token}, f)
@@ -224,5 +221,4 @@ class _CentralAPI:
 
         items = data.get("data") or data.get("clients") or []
         return items
-
 
