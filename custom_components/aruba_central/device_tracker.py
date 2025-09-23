@@ -86,7 +86,7 @@ PLATFORM_SCHEMA = BASE_PLATFORM_SCHEMA.extend(
     {
         vol.Required(CONF_CLIENT_ID): cv.string,
         vol.Required(CONF_CLIENT_SECRET): cv.string,
-        vol.Required(CONF_REFRESH_TOKEN): cv.string,
+        vol.Optional(CONF_REFRESH_TOKEN): cv.string,
         vol.Required(CONF_API_BASE): cv.url,
         vol.Optional(CONF_OAUTH_BASE): cv.url,
         vol.Optional(CONF_CUSTOMER_ID): cv.string,
