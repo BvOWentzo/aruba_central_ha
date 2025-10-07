@@ -1,18 +1,7 @@
-# Aruba Central Device Tracker voor Home Assistant
-# ------------------------------------------------
-# Deze aangepaste versie slaat de `refresh_token` automatisch op in een YAML-bestand
-# en leest deze in bij opstarten. Hierdoor hoef je na een herstart geen token meer
-# handmatig in je config aan te passen.
-#
-# Bestand: custom_components/aruba_central/device_tracker.py
-# YAML-tokenbestand: homeassistant/aruba_tokens.yaml
-
 from __future__ import annotations
 
 import logging
 import time
-import os
-import yaml  # PyYAML is standaard geïnstalleerd in Home Assistant
 from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
@@ -30,8 +19,10 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 _LOGGER = logging.getLogger(__name__)
 
+# Laat HA ons ~elke 60s aanroepen i.p.v. ~12s (legacy scheduler)
 SCAN_INTERVAL = timedelta(seconds=60)
 
+# Config keys
 CONF_CLIENT_ID = "client_id"
 CONF_CLIENT_SECRET = "client_secret"
 CONF_REFRESH_TOKEN = "refresh_token"
@@ -46,14 +37,16 @@ CONF_SCAN_INTERVAL = "scan_interval"
 DEFAULT_CLIENT_TYPE = "WIRELESS"
 DEFAULT_SCAN_INTERVAL_S = 60
 
-REFRESH_TOKEN_FILE = "homeassistant/aruba_tokens.yaml"
 
 def _flatten_conf(config: dict) -> dict:
+    """Ondersteun zowel {device_tracker:{...}} als platte dict."""
     if DEVICE_TRACKER_DOMAIN in config and isinstance(config[DEVICE_TRACKER_DOMAIN], dict):
         return config[DEVICE_TRACKER_DOMAIN]
     return config
 
+
 def _parse_scan_interval(val) -> int:
+    """Accepteer int seconden of 'HH:MM:SS' string. Fallback op default."""
     if val is None:
         return DEFAULT_SCAN_INTERVAL_S
     if isinstance(val, int):
@@ -69,20 +62,24 @@ def _parse_scan_interval(val) -> int:
                 return max(5, m * 60 + s)
             return max(5, int(val))
         except Exception:
-            _LOGGER.error("scan_interval '%s' ongeldig, gebruik default %ss", val, DEFAULT_SCAN_INTERVAL_S)
+            _LOGGER.error(
+                "aruba_central(DeviceScanner): invalid scan_interval '%s', using default %ss",
+                val, DEFAULT_SCAN_INTERVAL_S
+            )
             return DEFAULT_SCAN_INTERVAL_S
     try:
-        return max(5, int(val.total_seconds()))
+        return max(5, int(val.total_seconds()))  # type: ignore[attr-defined]
     except Exception:
         return DEFAULT_SCAN_INTERVAL_S
+
 
 PLATFORM_SCHEMA = BASE_PLATFORM_SCHEMA.extend(
     {
         vol.Required(CONF_CLIENT_ID): cv.string,
         vol.Required(CONF_CLIENT_SECRET): cv.string,
-        vol.Optional(CONF_REFRESH_TOKEN): cv.string,
+        vol.Required(CONF_REFRESH_TOKEN): cv.string,
         vol.Required(CONF_API_BASE): cv.url,
-        vol.Optional(CONF_OAUTH_BASE): cv.url,
+        vol.Optional(CONF_OAUTH_BASE): cv.url,  # default = api_base
         vol.Optional(CONF_CUSTOMER_ID): cv.string,
         vol.Optional(CONF_GROUP): cv.string,
         vol.Optional(CONF_SITE): cv.string,
@@ -91,11 +88,12 @@ PLATFORM_SCHEMA = BASE_PLATFORM_SCHEMA.extend(
     }
 )
 
+
 async def async_get_scanner(hass: HomeAssistant, config: dict) -> Optional[DeviceScanner]:
     _LOGGER.warning("aruba_central(DeviceScanner): async_get_scanner START")
     conf = _flatten_conf(config)
 
-    for k in (CONF_CLIENT_ID, CONF_CLIENT_SECRET, CONF_API_BASE):
+    for k in (CONF_CLIENT_ID, CONF_CLIENT_SECRET, CONF_REFRESH_TOKEN, CONF_API_BASE):
         if k not in conf:
             _LOGGER.error("aruba_central(DeviceScanner): missing required option: %s", k)
             return None
@@ -114,7 +112,7 @@ async def async_get_scanner(hass: HomeAssistant, config: dict) -> Optional[Devic
         oauth_base=oauth_base,
         client_id=conf[CONF_CLIENT_ID],
         client_secret=conf[CONF_CLIENT_SECRET],
-        refresh_token=conf.get(CONF_REFRESH_TOKEN, ""),
+        refresh_token=conf[CONF_REFRESH_TOKEN],
         customer_id=conf.get(CONF_CUSTOMER_ID),
         group=conf.get(CONF_GROUP),
         site=conf.get(CONF_SITE),
@@ -125,45 +123,34 @@ async def async_get_scanner(hass: HomeAssistant, config: dict) -> Optional[Devic
     _LOGGER.warning("aruba_central(DeviceScanner): async_get_scanner DONE")
     return scanner
 
+
 class _CentralAPI:
     def __init__(
-        self,
-        session: aiohttp.ClientSession,
-        api_base: str,
-        oauth_base: str,
-        client_id: str,
-        client_secret: str,
-        refresh_token: str,
-        customer_id: Optional[str],
+            self,
+            session: aiohttp.ClientSession,
+            api_base: str,
+            oauth_base: str,
+            client_id: str,
+            client_secret: str,
+            refresh_token: str,
+            customer_id: Optional[str],
     ):
         self.s = session
         self.api_base = api_base
         self.oauth_base = oauth_base
         self.client_id = client_id
         self.client_secret = client_secret
+        self.refresh_token = refresh_token
         self.customer_id = customer_id
         self.access_token: Optional[str] = None
         self.expiry = 0.0
-        self._refresh_token_file = REFRESH_TOKEN_FILE
-
-        if os.path.exists(self._refresh_token_file):
-            try:
-                with open(self._refresh_token_file, "r") as f:
-                    yml = yaml.safe_load(f) or {}
-                    self.refresh_token = yml.get("refresh_token", refresh_token)
-                    _LOGGER.warning("aruba_central: refresh_token geladen uit YAML")
-            except Exception as e:
-                _LOGGER.error("aruba_central: fout bij lezen aruba_tokens.yaml: %s", e)
-                self.refresh_token = refresh_token
-        else:
-            _LOGGER.warning("aruba_central: YAML-bestand niet gevonden, gebruik token uit configuratie")
-            self.refresh_token = refresh_token
-
-        if not self.refresh_token:
-            raise ValueError("Geen geldige refresh_token gevonden in configuratie of YAML-bestand")
 
     async def _ensure_token(self):
         if self.access_token and time.time() < self.expiry - 60:
+            _LOGGER.debug(
+                "aruba_central(DeviceScanner): using cached token (expires_in=%ss)",
+                int(self.expiry - time.time()),
+            )
             return
 
         url = f"{self.oauth_base}/oauth2/token"
@@ -173,23 +160,18 @@ class _CentralAPI:
             "client_secret": self.client_secret,
             "refresh_token": self.refresh_token,
         }
+        _LOGGER.warning("aruba_central(DeviceScanner): POST %s (OAuth refresh)", url)
         async with self.s.post(url, data=data, timeout=30) as r:
             txt = await r.text()
             if r.status != 200:
-                _LOGGER.error("aruba_central: token refresh mislukt %s: %s", r.status, txt)
-                raise RuntimeError(f"Token refresh mislukt {r.status}: {txt}")
+                _LOGGER.error("aruba_central(DeviceScanner): token refresh failed %s: %s", r.status, txt)
+                raise RuntimeError(f"Token refresh failed {r.status}: {txt}")
             j = await r.json()
 
         self.access_token = j.get("access_token")
         self.refresh_token = j.get("refresh_token", self.refresh_token)
         self.expiry = time.time() + int(j.get("expires_in", 3600))
-
-        try:
-            with open(self._refresh_token_file, "w") as f:
-                yaml.dump({"refresh_token": self.refresh_token}, f)
-                _LOGGER.warning("aruba_central: nieuwe refresh_token opgeslagen in YAML")
-        except Exception as e:
-            _LOGGER.error("aruba_central: fout bij schrijven aruba_tokens.yaml: %s", e)
+        _LOGGER.warning("aruba_central(DeviceScanner): token ok; expires_in=%s", j.get("expires_in"))
 
     def _headers(self) -> Dict[str, str]:
         h = {"Authorization": f"Bearer {self.access_token}"}
@@ -197,7 +179,9 @@ class _CentralAPI:
             h["TenantID"] = self.customer_id
         return h
 
-    async def list_clients(self, *, group: Optional[str], site: Optional[str], client_type: str) -> List[Dict[str, Any]]:
+    async def list_clients(
+            self, *, group: Optional[str], site: Optional[str], client_type: str
+    ) -> List[Dict[str, Any]]:
         await self._ensure_token()
         url = f"{self.api_base}/monitoring/v2/clients"
         params: Dict[str, Any] = {"client_status": "CONNECTED", "limit": 1000}
@@ -208,31 +192,34 @@ class _CentralAPI:
         elif site:
             params["site"] = site
 
+        _LOGGER.warning("aruba_central(DeviceScanner): GET %s params=%s", url, params)
         async with self.s.get(url, headers=self._headers(), params=params, timeout=30) as r:
             txt = await r.text()
             if r.status != 200:
-                _LOGGER.error("aruba_central: ophalen clients mislukt %s: %s", r.status, txt)
+                _LOGGER.error("aruba_central(DeviceScanner): clients fetch failed %s: %s", r.status, txt)
                 raise RuntimeError(f"clients fetch failed {r.status}: {txt}")
             data = await r.json()
 
         items = data.get("data") or data.get("clients") or []
+        _LOGGER.warning("aruba_central(DeviceScanner): total clients returned=%s", len(items))
         return items
 
 class ArubaCentralScanner(DeviceScanner):
     def __init__(
-        self,
-        hass: HomeAssistant,
-        session: aiohttp.ClientSession,
-        api_base: str,
-        oauth_base: str,
-        client_id: str,
-        client_secret: str,
-        refresh_token: str,
-        customer_id: Optional[str],
-        group: Optional[str],
-        site: Optional[str],
-        client_type: str,
-        min_interval_s: int,
+            self,
+            *,
+            hass: HomeAssistant,
+            session: aiohttp.ClientSession,
+            api_base: str,
+            oauth_base: str,
+            client_id: str,
+            client_secret: str,
+            refresh_token: str,
+            customer_id: Optional[str],
+            group: Optional[str],
+            site: Optional[str],
+            client_type: str,
+            min_interval_s: int,
     ):
         self._hass = hass
         self._api = _CentralAPI(
@@ -253,7 +240,8 @@ class ArubaCentralScanner(DeviceScanner):
         self._last_by_mac: Dict[str, Dict[str, Any]] = {}
 
     async def async_init(self):
-        _LOGGER.warning("aruba_central(DeviceScanner): init api_base=%s oauth_base=%s group=%s site=%s type=%s min=%ss",
+        _LOGGER.warning(
+            "aruba_central(DeviceScanner): init api_base=%s oauth_base=%s group=%s site=%s type=%s min=%ss",
             self._api.api_base, self._api.oauth_base, self._group, self._site, self._client_type, self._min_interval_s
         )
         try:
@@ -265,7 +253,10 @@ class ArubaCentralScanner(DeviceScanner):
         now = time.time()
         age = now - self._last_fetch_ts
         if self._last_fetch_ts and age < self._min_interval_s:
-            _LOGGER.warning("aruba_central(DeviceScanner): HA poll; prev_age=%ss; throttle=%ss → cache only", int(age), self._min_interval_s)
+            _LOGGER.warning(
+                "aruba_central(DeviceScanner): HA poll; prev_age=%ss; throttle=%ss → cache only",
+                int(age), self._min_interval_s
+            )
             return
         _LOGGER.warning("aruba_central(DeviceScanner): DECISION first run or min age met → call Central")
         clients = await self._api.list_clients(group=self._group, site=self._site, client_type=self._client_type)
@@ -295,6 +286,7 @@ class ArubaCentralScanner(DeviceScanner):
                 "name": c.get("name") or c.get("hostname") or mac,
             }
 
+        # Direct not_home voor verdwenen clients
         offline_macs = set(self._last_by_mac.keys()) - set(new_by_mac.keys())
         for mac in offline_macs:
             _LOGGER.debug("aruba_central(DeviceScanner): %s → not_home (missing in latest Central list)", mac)
@@ -316,6 +308,7 @@ class ArubaCentralScanner(DeviceScanner):
         return out
 
     async def async_see(self, mac: str, host_name: Optional[str] = None, location_name: str = "home"):
+        # Gebruik de service call (stabiel in huidige HA builds), en markeer als router bron
         payload = {
             "mac": mac,
             "host_name": host_name,
