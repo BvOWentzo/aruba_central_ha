@@ -5,6 +5,7 @@ import time
 from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
+import asyncio
 import aiohttp
 import voluptuous as vol
 
@@ -16,6 +17,7 @@ from homeassistant.components.device_tracker import (
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -127,6 +129,7 @@ async def async_get_scanner(hass: HomeAssistant, config: dict) -> Optional[Devic
 class _CentralAPI:
     def __init__(
             self,
+            hass: HomeAssistant,
             session: aiohttp.ClientSession,
             api_base: str,
             oauth_base: str,
@@ -145,33 +148,71 @@ class _CentralAPI:
         self.access_token: Optional[str] = None
         self.expiry = 0.0
 
-    async def _ensure_token(self):
-        if self.access_token and time.time() < self.expiry - 60:
-            _LOGGER.debug(
-                "aruba_central(DeviceScanner): using cached token (expires_in=%ss)",
-                int(self.expiry - time.time()),
+        # Persistent storage for tokens (in .storage/aruba_central.tokens)
+        self._store = Store(hass, 1, "aruba_central.tokens")
+        self._token_lock = asyncio.Lock()
+
+    async def load_cached_tokens(self):
+        """Load last saved access/refresh tokens from HA storage (survive reboots)."""
+        try:
+            data = await self._store.async_load()
+            if data:
+                self.access_token = data.get("access_token")
+                self.refresh_token = data.get("refresh_token", self.refresh_token)
+                try:
+                    self.expiry = float(data.get("expiry") or 0.0)
+                except Exception:
+                    self.expiry = 0.0
+                _LOGGER.warning(
+                    "aruba_central(DeviceScanner): loaded cached tokens; expires_in=%ss",
+                    max(0, int(self.expiry - time.time())),
+                )
+        except Exception as e:
+            _LOGGER.error("aruba_central(DeviceScanner): failed to load token cache: %s", e)
+
+    async def _persist_tokens(self):
+        """Persist current access/refresh tokens to HA storage."""
+        try:
+            await self._store.async_save(
+                {
+                    "access_token": self.access_token,
+                    "refresh_token": self.refresh_token,
+                    "expiry": self.expiry,
+                    "updated": time.time(),
+                }
             )
-            return
+        except Exception as e:
+            _LOGGER.error("aruba_central(DeviceScanner): failed to persist tokens: %s", e)
 
-        url = f"{self.oauth_base}/oauth2/token"
-        data = {
-            "grant_type": "refresh_token",
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "refresh_token": self.refresh_token,
-        }
-        _LOGGER.warning("aruba_central(DeviceScanner): POST %s (OAuth refresh)", url)
-        async with self.s.post(url, data=data, timeout=30) as r:
-            txt = await r.text()
-            if r.status != 200:
-                _LOGGER.error("aruba_central(DeviceScanner): token refresh failed %s: %s", r.status, txt)
-                raise RuntimeError(f"Token refresh failed {r.status}: {txt}")
-            j = await r.json()
+    async def _ensure_token(self):
+        async with self._token_lock:
+            if self.access_token and time.time() < self.expiry - 60:
+                _LOGGER.debug(
+                    "aruba_central(DeviceScanner): using cached token (expires_in=%ss)",
+                    int(self.expiry - time.time()),
+                )
+                return
 
-        self.access_token = j.get("access_token")
-        self.refresh_token = j.get("refresh_token", self.refresh_token)
-        self.expiry = time.time() + int(j.get("expires_in", 3600))
-        _LOGGER.warning("aruba_central(DeviceScanner): token ok; expires_in=%s", j.get("expires_in"))
+            url = f"{self.oauth_base}/oauth2/token"
+            data = {
+                "grant_type": "refresh_token",
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "refresh_token": self.refresh_token,
+            }
+            _LOGGER.warning("aruba_central(DeviceScanner): POST %s (OAuth refresh)", url)
+            async with self.s.post(url, data=data, timeout=30) as r:
+                txt = await r.text()
+                if r.status != 200:
+                    _LOGGER.error("aruba_central(DeviceScanner): token refresh failed %s: %s", r.status, txt)
+                    raise RuntimeError(f"Token refresh failed {r.status}: {txt}")
+                j = await r.json()
+
+            self.access_token = j.get("access_token")
+            self.refresh_token = j.get("refresh_token", self.refresh_token)
+            self.expiry = time.time() + int(j.get("expires_in", 3600))
+            await self._persist_tokens()
+            _LOGGER.warning("aruba_central(DeviceScanner): token ok; expires_in=%s", j.get("expires_in"))
 
     def _headers(self) -> Dict[str, str]:
         h = {"Authorization": f"Bearer {self.access_token}"}
@@ -223,6 +264,7 @@ class ArubaCentralScanner(DeviceScanner):
     ):
         self._hass = hass
         self._api = _CentralAPI(
+            hass=hass,
             session=session,
             api_base=api_base,
             oauth_base=oauth_base,
@@ -245,6 +287,9 @@ class ArubaCentralScanner(DeviceScanner):
             self._api.api_base, self._api.oauth_base, self._group, self._site, self._client_type, self._min_interval_s
         )
         try:
+            # 1) tokens laden uit storage (overleeft reboot)
+            await self._api.load_cached_tokens()
+            # 2) token valideren/verversen
             await self._api._ensure_token()
         except Exception as e:
             _LOGGER.error("aruba_central(DeviceScanner): initial token refresh failed: %s", e)
