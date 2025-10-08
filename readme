@@ -1,27 +1,27 @@
-Aruba Central Device Tracker voor Home Assistant
+# Aruba Central Device Tracker voor Home Assistant
 
 Deze integratie maakt het mogelijk om Aruba Central clients (bijv. Wi-Fi clients) automatisch te volgen via de device_tracker component in Home Assistant.
 
-Belangrijkste features:
+## Belangrijkste features:
 
-- Ondersteunt Aruba Central OAuth2-tokenflow
-- Automatisch vernieuwen van access- en refresh tokens
-- Externe opslag van de refresh_token in een bewerkbaar .yaml-bestand
-- Slimme caching en throttle op polling (standaard: 60s)
-- Logging op API-calls, client-telling, statusupdates en tokenbeheer
+- ✅ OAuth2 via refresh_token (geen lokale username/password nodig) 
+- 🔁 Automatisch verversen access_token + opslaan in HA Storage (`.storage/aruba_central.tokens`)
+- 🧠 Slimme caching & throttling: minimaliseert API‑calls; default interval 60s (instelbaar)
+- 🧾 Duidelijke logging rond tokenbeheer, API-calls en clienttellingen
 
-Bestandstructuur:
+## Bestandstructuur:
 
+```
 homeassistant/
 ├── configuration.yaml                ← Bevat client_id, client_secret etc.
-├── aruba_tokens.yaml                 ← Hierin wordt automatisch de refresh_token opgeslagen
 └── custom_components/
     └── aruba_central/
-        └── device_tracker.py        ← Hoofdscript
+        └── device_tracker.py        ← Hoofdscript 
+  ```
 
-Configuratievoorbeeld (in configuration.yaml):
+## Configuratie (in configuration.yaml):
 
-device_tracker:
+```device_tracker:
   - platform: aruba_central
     client_id: "jouw_client_id"
     client_secret: "jouw_client_secret"
@@ -30,31 +30,9 @@ device_tracker:
     oauth_base: "https://eu.central.arubanetworks.com"
     group: "NAAM_VAN_JE_GROUP"
     scan_interval: 60
+   ```
 
-Hoe werkt het tokenbeheer?
-
-1. Bij het opstarten van Home Assistant:
-   - De integratie probeert eerst de refresh_token te laden uit homeassistant/aruba_tokens.yaml
-   - Als dat bestand niet bestaat of onleesbaar is, wordt de token uit configuration.yaml gebruikt (fallback)
-
-2. Bij het ophalen van een nieuwe access_token:
-   - Als Aruba Central een nieuwe refresh_token teruggeeft, wordt die automatisch opgeslagen in het YAML-bestand.
-
-Dit zorgt ervoor dat de authenticatie ook na een herstart werkt zonder handmatige aanpassingen.
-
-Voorbeeld aruba_tokens.yaml:
-
-refresh_token: "ya29.A0ARrdaM9...etc..."
-
-Zorg dat dit bestand schrijfbaar is voor Home Assistant (het script schrijft dit automatisch weg).
-
-Tips voor beheer:
-
-- Verberg aruba_tokens.yaml in je versiebeheer (.gitignore) als je Git gebruikt
-- Als je handmatig een nieuwe token plaatst, pas alleen aruba_tokens.yaml aan
-- Bekijk logoutput met: tail -f home-assistant.log | grep aruba_central
-
-Ondersteuning en ontwikkeling:
+## Ondersteuning en ontwikkeling:
 
 Deze integratie is custom-built voor gebruik met Aruba Central API v1/v2 en getest met WIRELESS clients.
 
